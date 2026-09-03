@@ -19,3 +19,4 @@ function(tinystore_add_benchmark name)
 endfunction()
 
 tinystore_add_benchmark(arena_bench)
+tinystore_add_benchmark(db_bench)

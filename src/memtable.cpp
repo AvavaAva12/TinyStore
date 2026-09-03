@@ -41,8 +41,11 @@ void MemTable::Add(SequenceNumber seq, ValueType type, const Slice& key,
 Status MemTable::Get(const Slice& user_key, SequenceNumber snapshot,
                      std::string* value) const {
   LookupKey lkey(user_key, snapshot);
-  std::lock_guard<std::mutex> lock(mu_);
 
+  // 无锁读：跳表的 next 指针是 atomic（release 发布 / acquire 读取），
+  // 读者顺着指针走不会被写者的插入撕裂。Arena 节点随 MemTable 一次性释放，
+  // 且读期间通过外部 Ref 保证 MemTable 不被销毁，因此这里不需要任何互斥锁。
+  // 这样快照读与前台写完全并行，不被 mu_ 阻塞。
   SkipList<const char*, MemTableKeyComparator>::Iterator iter(&table_);
   iter.Seek(lkey.data());
   if (!iter.Valid()) {

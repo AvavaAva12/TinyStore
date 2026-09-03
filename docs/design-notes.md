@@ -198,15 +198,18 @@ memcmp  : 首字节 0x00 < 0xFF  ->  A < B   （错误！）
 
 | 检查项 | 命令 | 状态 |
 |---|---|---|
-| 单元测试 | `ctest --test-dir build` | ✅ 12/12 通过 |
-| 内存安全（ASAN + Debug assert） | `ctest --test-dir build-asan` | ✅ 12/12 通过 |
-| 并发安全（TSAN） | `ctest --test-dir build-tsan` | ✅ 12/12 通过 |
+| 单元测试 | `ctest --test-dir build` | ✅ 13/13 通过 |
+| 内存安全（ASAN + Debug assert） | `ctest --test-dir build-asan` | ✅ 13/13 通过 |
+| 并发安全（TSAN） | `ctest --test-dir build-tsan` | ✅ 13/13 通过 |
 | 编译警告 | `-Wall -Wextra -Wpedantic -Wshadow ...` | ✅ 零警告 |
 
 Debug 构建下所有 `assert` 均生效，意味着 Arena 对齐、InternalKey 长度、
-后缀解析等不变式都经过了运行时校验。W2 新增的 5 个测试目标
-（`crc32c_test` / `skiplist_test` / `memtable_test` / `write_batch_test` / `log_test`）
-在 none / asan / tsan 三种配置下全部通过。
+后缀解析等不变式都经过了运行时校验。W2/W3 累计 13 个测试目标
+（`slice_test` / `coding_test` / `status_test` / `comparator_test` / `arena_test` /
+`internal_key_test` / `env_test` / `crc32c_test` / `skiplist_test` / `memtable_test` /
+`write_batch_test` / `log_test` / `db_test`）在 none / asan / tsan 三种配置下全部通过；
+其中 `db_test` 的并发用例（8 线程 × 200 次写 + 读）专门给 TSAN 提供
+"Group Commit + 无锁读" 的数据竞争覆盖。
 
 ### TSAN 在本机 WSL2 下的状态
 
@@ -425,16 +428,154 @@ CRC32C 的标准校验向量是 `"123456789" -> 0xE3069283`，
 
 ---
 
-## 七、下一步（W3）
+## 七、W3 设计取舍（DB / Group Commit / 无锁读）
 
-写路径已通，但还有两处明显瓶颈，W3 集中攻坚：
+W2 把 WriteBatch / WAL / MemTable / SkipList / CRC32C 五个组件做好了，
+但彼此独立、没有串成一条"写路径"。W3 的目标就是**第一次把它们接成一个能写、
+能读、能持久化、能崩溃恢复的引擎**，并顺手解决写路径上两个最大的瓶颈：
+**Group Commit**（把多次 fsync 合并成一次）和**放开 MemTable 读写锁**。
 
-- **Group Commit**：把多个并发写请求合并成一次 WAL `fsync`，
-  fsync 在机械盘上可达毫秒级，是写入路径主要开销；合并后通常一个数量级 QPS 提升。
-  复用 W2 已落地的 `WriteBatch::Append` 做批拼接。
-- **放开 MemTable 读写锁**：当前 `Add` / `Get` 共用一把互斥锁，写会阻塞读。
-  改为"写串行、读无锁"（SkipList 的 acquire/release 语义已就位），
-  让快照读完全不被前台写阻塞。
+### 7.1 `DB` —— 把组件接成写路径的胶水层
 
-之后才会进入读路径（SSTable / Block / Bloom Filter / 版本集 / Compaction），
-那是 W4 及以后。
+新增 `DB`（接口）+ `DBImpl`（实现），对外只暴露 `Open / Put / Delete / Get / Write`：
+
+- `Open`：建目录 → `Recover`（见 7.5）→ 建立可写 WAL；
+- `Write(batch)`：Group Commit 把 batch 追加进 WAL、回放到 MemTable；
+- `Put/Delete`：包一层单条记录的 WriteBatch 转发给 `Write`；
+- `Get`：直接查 MemTable，走无锁快照读（见 7.4）。
+
+刻意保持精简：**W3 不做 flush / SSTable / Compaction**（那是 W4+）。
+MemTable 是唯一的数据归宿，进程退出即丢；真正的持久化靠"每次写都 fsync 的 WAL"，
+下次 `Open` 重放即可恢复。这样 W3 聚焦在写路径的两个优化上，不被读路径的
+复杂度分心。
+
+### 7.2 Group Commit —— 多个写请求共享一次 fsync
+
+**为什么必须做**：`WritableFile::Sync()` 就是 `fsync`，在机械盘上是**毫秒级**
+操作（SSD 也要几十微秒）。如果每次 `Put` 都自己 fsync，写入 QPS 被 fsync 延迟
+死死钉住；而实际上同一瞬间到达的成百上千个写，完全可以先在内存里拼成一个大
+batch，**整组只 fsync 一次**。fsync 次数从 N 降到 N / 平均组大小，通常是数量级提升。
+
+**实现（leader/follower 模型）**：
+```cpp
+Status DBImpl::Write(const WriteBatch& my_batch) {
+  Writer w{ &my_batch, false };
+  std::unique_lock<std::mutex> lock(mutex_);
+  writers_.push_back(&w);
+  // 不是队首 -> 已有 leader 在干活，等它唤醒（leader 会把我的 batch 一起提交）
+  while (!w.done && &w != writers_.front()) w.cv.wait(lock);
+  if (w.done) return w.status;
+
+  // 我是 leader：把队列里所有等待者合并成一个大 batch
+  WriteBatch combined;
+  for (Writer* it : writers_)
+    if (it->batch && it->batch->Count() > 0)
+      WriteBatchInternal::Append(&combined, it->batch);
+
+  SequenceNumber seq = last_sequence_ + 1;
+  WriteBatchInternal::SetSequence(&combined, seq);
+  Status s = log_->AddRecord(combined.Contents());
+  if (s.ok()) s = logfile_->Sync();          // ★ 整组只 fsync 一次
+  if (s.ok()) {
+    WriteBatchInternal::InsertInto(&combined, mem_.load(acquire));
+    last_sequence_.store(seq + combined.Count() - 1, release);  // 先写内存，再发布 seq
+  }
+  while (!writers_.empty()) {                // 唤醒同组所有 follower
+    Writer* ready = writers_.pop_front();
+    if (ready != &w) ready->status = s;
+    ready->done = true; ready->cv.notify_one();
+  }
+  return s;
+}
+```
+
+- `mutex_` 只保护 `writers_` 队列 + 把"WAL 追加 + fsync + 回放"串成**单写者**；
+  它**不**保护读路径（见 7.4），所以读不被这次 fsync 阻塞。
+- 队首线程成为 **leader**，负责把整组提交完；其余线程是 **follower**，
+  在各自 `cv` 上等待，被唤醒时本批已被 leader 写好、结果填在 `status` 里。
+- 复用 W2 的 `WriteBatch::Append` 做批拼接——这正是 W2 锚点"WAL 以 WriteBatch
+  为记录单位"的价值：合并只是字节串拼接，回放逻辑完全复用。
+
+**正确性不变量**：同一组共享同一个提交结果 `status`；sequence 连续分配，
+组内第 i 条记录的 sequence = 组起始 seq + i，回放进 MemTable 后正好是
+"要么整组可见、要么整组不可见"（原子性来自 WAL 一次落盘）。
+
+### 7.3 内存序：last_sequence_ 的 release / acquire
+
+`last_sequence_` 是已提交的最大 sequence，读者用它做 MVCC 快照读。关键约束：
+**必须先回放进 MemTable，再用 release 发布新的 last_sequence_**。这样读者用
+acquire 读到新 `last_sequence_` 时，happens-before 保证它一定能看到对应的
+MemTable 内容——不会出现"snapshot 说能看到 seq=100，但内存里 seq=100 还没插完"
+的撕裂读。
+
+`mem_` 本身用 `std::atomic<MemTable*>`（acquire 读 / release 写），为 W4 的
+flush "换表"留好无锁切换的口子；W3 里它全程稳定，只在 `Open` 时发布一次。
+
+### 7.4 放开 MemTable 读写锁 —— 读完全不被写阻塞
+
+W2 里 `MemTable::Add` 和 `Get` 都取同一把 `mu_`。W3 把 `Get` 的锁**去掉**：
+```cpp
+Status MemTable::Get(...) const {
+  LookupKey lkey(user_key, snapshot);
+  SkipList<...>::Iterator iter(&table_);   // 不取 mu_
+  ...                                     // 沿 next_ 指针走，全是 atomic acquire 读
+}
+```
+**为什么安全**：跳表从设计上就支持"单写者 + 多无锁读者"——`next_` 指针是
+`std::atomic`，写者插入时用 `release` 发布，读者用 `acquire` 读，不会看到撕裂
+的指针；节点由 Arena 一次性分配、随 MemTable 整体释放，读者期间通过 `DB::Get`
+里的 `Ref/Unref` 保活（W4 引入 flush 换表时，这层引用计数立刻生效，读不会被
+正在落盘的旧 MemTable 销毁）。`Add` 仍由 `mu_`（或 DB 写者队列）串行化，保证
+"单写者"前提。
+
+效果：快照读与前台写**完全并行**。`db_test.ConcurrentWritesAndReads` 用
+8 线程边写边读，TSAN 全程零竞争报告——这是"按需求选最弱同步"的又一次实践：
+读路径零互斥，正确性全靠原子指针的 acquire/release。
+
+> 踩坑（W3）：
+> 1. 最初 `Get` 一旦取 `mu_`，就会被 leader 那次毫秒级 fsync 阻塞——所谓
+>    "放开读写锁"就名存实亡。所以读路径必须彻底不碰 `mutex_`，只靠 `mem_` /
+>    `last_sequence_` 的 atomic 完成。
+> 2. `last_sequence_` 的发布顺序：必须先 `InsertInto` 再 `store(release)`。
+>    反过来（先发布 seq 再回放）会让读者用新 snapshot 去查还没写完的内存，
+>    得到错误结果而非崩溃——这类 bug TSAN 抓不到，靠 `db_test` 的最终一致性
+>    校验（所有 key 都该读到正确值）兜底。
+
+### 7.5 崩溃恢复：重放 WAL 重建 MemTable
+
+`Recover` 在 `Open` 时：读旧 WAL 的每条 record（本身就是一条 WriteBatch 字节串），
+用 `WriteBatch::SetContents` 灌进一个 `WriteBatch` 再 `InsertInto` 回放到 MemTable，
+同时用头部 seq 恢复 `last_sequence_`；恢复完建立一条**截断重写**的新 WAL
+（内容已进内存，无需保留旧日志）。WAL 的"分片 + crc + 最后一个不完整块当 EOF"
+机制（见 W2 6.5）保证即使崩溃发生在写一半，也只丢弃那半个块，前面的 record
+全部可恢复。`db_test.RecoverAfterReopen` 覆盖"写 200 条 + 删 1 条 → 销毁 →
+重开 → 数据完好（含墓碑）"。
+
+### 7.6 Group Commit 的真实收益：测量与诚实结论
+
+`db_bench` 对比单线程顺序写与多线程并发写。本机（WSL2，WAL 落在 `/tmp`，
+fsync 极快）实测并发写只比顺序写略高——**因为 fsync 本身够快，合并的收益被
+线程创建 / 调度开销掩盖**。这是必须诚实写进来的结论：
+
+> Group Commit 的 10× 级收益来自"把 N 次毫秒级 fsync 合成 1 次"。在 fsync
+> 便宜的环境（tmpfs、部分 SSD、WSL 的虚拟磁盘）上几乎看不出来；在真实机械盘
+> 或高 fsync 延迟的云盘上才会显著。收益是**结构性**的，不依赖本机测速数字。
+
+这恰好是面试里比"报一个漂亮数字"更有说服力的点：能说清"优化在哪、为什么本机
+测不出来、真实场景会怎样"。
+
+---
+
+## 八、下一步（W4）
+
+写路径已经完整且高效（Group Commit + 无锁读），但 MemTable 是纯内存、进程退出
+即丢、且无法支撑大于内存的数据集。W4 进入**读路径与持久化层**：
+
+- **SSTable**：不可变的有序文件，内部切成 data block + index block + bloom block；
+- **Block 读取 + Bloom Filter**：把"点查"从"全表扫"降到 O(1) 次 IO；
+- **flush**：MemTable 写满后整体落成一个 SSTable（用 W3 的引用计数安全换出）；
+- **版本管理（Version / VersionSet / MANIFEST）**：让 flush / 读 / 未来的
+  compaction 三线并发时，旧 SSTable 不被正在读的线程销毁（W1 锚点 6/7 在此落地）；
+- **读路径统一**：Get 先查 MemTable，未命中再查 SSTable 层，合并出最新可见版本。
+
+之后才是 Compaction、MVCC 多版本回收、以及可选的 Raft 复制。

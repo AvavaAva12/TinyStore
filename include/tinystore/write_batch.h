@@ -58,6 +58,10 @@ public:
   // 完整字节串（含头部），用于序列化进 WAL
   const std::string& Contents() const { return rep_; }
 
+  // 用一段已编码的字节串直接覆盖内容（用于 WAL 回放：读出的 record
+  // 本身就是一条 WriteBatch 字节串，原样灌进来再 Iterate/InsertInto 即可）
+  void SetContents(const Slice& contents);
+
   // 解码 record 段，逐条回调 handler。遇到非法格式返回 Corruption。
   Status Iterate(Handler* handler) const;
 

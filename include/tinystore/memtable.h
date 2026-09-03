@@ -138,7 +138,10 @@ private:
   Arena arena_;
   SkipList<const char*, MemTableKeyComparator> table_;
   std::atomic<int> refs_;
-  mutable std::mutex mu_;  // W2：写与读都加锁（W3 放开为只锁写）
+  // 只保护"写"路径。读路径（Get）走跳表的无锁读，不取这把锁——
+  // 这样快照读完全不被前台写阻塞（见 W3 设计笔记）。跳表本身假设"单写者"，
+  // 因此 Add 必须串行（由 DB 的写者队列或这把锁保证），Get 则可多读者并发。
+  mutable std::mutex mu_;
 };
 
 }  // namespace tinystore

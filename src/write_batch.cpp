@@ -35,6 +35,10 @@ uint32_t WriteBatch::Count() const {
   return DecodeFixed32(rep_.data() + 8);
 }
 
+void WriteBatch::SetContents(const Slice& contents) {
+  rep_.assign(contents.data(), contents.size());
+}
+
 Status WriteBatch::Iterate(Handler* handler) const {
   Slice input(rep_);
   if (input.size() < 12) {
