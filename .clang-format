@@ -1,0 +1,38 @@
+---
+# 基于 Google 风格，针对本项目的可读性做了少量调整。
+# 用法: find src include tests benchmarks -name '*.cpp' -o -name '*.h' | xargs clang-format -i
+BasedOnStyle: Google
+
+Language: Cpp
+Standard: c20
+
+ColumnLimit: 90              # 比默认 80 略宽，避免系统级代码被切得过碎
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+AccessModifierOffset: -2
+
+# 指针/引用紧贴类型名：char* p 而非 char *p
+# 理由是强调"类型"而非"语法"，在阅读 Arena / Slice 这类代码时更清晰。
+DerivePointerAlignment: false
+PointerAlignment: Left
+
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+
+BreakBeforeBraces: Attach
+NamespaceIndentation: None
+
+# 让 #include 按分组排序，便于一眼看出模块依赖
+SortIncludes: CaseInsensitive
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^"tinystore/'
+    Priority: 1
+  - Regex: '^<.*\.h>'
+    Priority: 2
+  - Regex: '^<.*'
+    Priority: 3
+  - Regex: '.*'
+    Priority: 4

@@ -1,0 +1,44 @@
+---
+# 保守的静态检查集：只启用误报率低、收益高的检查项。
+# 全量启用 modernize-* 会产生大量与本项目（刻意贴近底层、手写内存管理）冲突的建议。
+#
+# 用法: clang-tidy -p build src/*.cpp -- -std=c++20
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  clang-analyzer-*,
+  cppcoreguidelines-init-variables,
+  cppcoreguidelines-pro-type-member-init,
+  misc-unused-parameters,
+  misc-unused-using-decls,
+  modernize-use-nullptr,
+  modernize-use-override,
+  modernize-use-default-member-init,
+  performance-unnecessary-copy-initialization,
+  readability-braces-around-statements,
+  readability-identifier-naming
+
+WarningsAsErrors: ''
+HeaderFilterRegex: 'tinystore/.*\.h$'
+FormatStyle: file
+
+CheckOptions:
+  - key:   readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key:   readability-identifier-naming.StructCase
+    value: CamelCase
+  - key:   readability-identifier-naming.FunctionCase
+    value: lower_case
+  - key:   readability-identifier-naming.VariableCase
+    value: lower_case
+  - key:   readability-identifier-naming.MemberCase
+    value: lower_case
+  - key:   readability-identifier-naming.PrivateMemberSuffix
+    value: _
+  - key:   readability-identifier-naming.NamespaceCase
+    value: lower_case
+  - key:   readability-identifier-naming.ConstexprVariableCase
+    value: lower_case
+  - key:   readability-identifier-naming.EnumConstantCase
+    value: kCamelCase

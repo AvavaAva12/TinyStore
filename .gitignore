@@ -1,0 +1,23 @@
+# 构建产物
+build/
+build-*/
+cmake-build-*/
+compile_commands.json
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# 测试与运行时数据（数据库实例、日志、测试数据目录）
+*.log
+/data/
+/tmp/
+testdb/
+
+# 性能剖析产物
+perf.data
+perf.data.old
+*.svg
+callgrind.out.*
