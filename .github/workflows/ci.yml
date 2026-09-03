@@ -1,0 +1,46 @@
+name: CI
+
+# 触发：推到 main 或向 main 开 PR 时自动跑。
+# 目的：证明仓库在「干净环境 + 主流工具链」下能构建并通过全部测试，
+#       并且 ASAN / TSAN 下无内存错误与数据竞争 —— 这是面试官可直接点开看的质量证明。
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.sanitizer }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [ none, asan, tsan ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Configure
+        run: |
+          SAN=()
+          case "${{ matrix.sanitizer }}" in
+            asan)
+              SAN+=(-DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer")
+              ;;
+            tsan)
+              SAN+=(-DCMAKE_CXX_FLAGS="-fsanitize=thread")
+              ;;
+          esac
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug "${SAN[@]}"
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j "$(nproc)"
