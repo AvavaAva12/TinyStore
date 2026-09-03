@@ -15,6 +15,11 @@ add_library(tinystore STATIC
     arena.cpp
     internal_key.cpp
     env_posix.cpp
+    crc32c.cpp
+    memtable.cpp
+    write_batch.cpp
+    log_writer.cpp
+    log_reader.cpp
 )
 
 target_include_directories(tinystore

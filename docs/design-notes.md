@@ -198,34 +198,35 @@ memcmp  : 首字节 0x00 < 0xFF  ->  A < B   （错误！）
 
 | 检查项 | 命令 | 状态 |
 |---|---|---|
-| 单元测试 | `ctest --test-dir build` | ✅ 7/7 通过 |
-| 内存安全（ASAN + Debug assert） | `ctest --test-dir build-asan` | ✅ 7/7 通过 |
-| 并发安全（TSAN） | `ctest --test-dir build-tsan` | ⚠️ WSL2 下 TSAN 无法运行，见下 |
+| 单元测试 | `ctest --test-dir build` | ✅ 12/12 通过 |
+| 内存安全（ASAN + Debug assert） | `ctest --test-dir build-asan` | ✅ 12/12 通过 |
+| 并发安全（TSAN） | `ctest --test-dir build-tsan` | ✅ 12/12 通过 |
 | 编译警告 | `-Wall -Wextra -Wpedantic -Wshadow ...` | ✅ 零警告 |
 
 Debug 构建下所有 `assert` 均生效，意味着 Arena 对齐、InternalKey 长度、
-后缀解析等不变式都经过了运行时校验。
+后缀解析等不变式都经过了运行时校验。W2 新增的 5 个测试目标
+（`crc32c_test` / `skiplist_test` / `memtable_test` / `write_batch_test` / `log_test`）
+在 none / asan / tsan 三种配置下全部通过。
 
-### TSAN 在 WSL2 下的限制与解法
+### TSAN 在本机 WSL2 下的状态
 
-直接运行 TSAN 构建会报：
+早期在另一台 WSL 镜像上遇到过：
 ```
 FATAL: ThreadSanitizer: unexpected memory mapping
 ```
 原因是 TSAN 要求进程地址空间落在特定范围内，与 WSL2 内核的
-地址随机化（`randomize_va_space=2`）冲突。
+地址随机化（`randomize_va_space=2`）冲突。本机 `Ubuntu-24.04` 镜像上
+**该问题不复现**，TSAN 构建可直接 `ctest` 跑通（W2 全绿）。
 
-**已验证可用的解法**（无需改系统配置，仅对单个进程关闭 ASLR）：
+若日后换镜像又触发，已验证可用的解法（无需改系统配置，仅对单个进程关闭 ASLR）：
 ```bash
-setarch x86_64 -R ./build-tsan/bin/env_test
+setarch x86_64 -R ./build-tsan/bin/<test>
 ```
-因此可以把它包进 CMake：让 `add_test` 的命令变成
-`setarch -R <exe>`。在 W8 并发攻坚阶段统一接入。
-
+可把它包进 CMake：让 `add_test` 的命令变成 `setarch -R <exe>`。
 其它备选：
 ```bash
 sudo sysctl -w vm.mmap_rnd_bits=28       # WSL 重启后失效
-valgrind --tool=helgrind ./build/bin/env_test   # 慢但一定能跑
+valgrind --tool=helgrind ./build/bin/<test>   # 慢但一定能跑
 ```
 
 ### TSAN 抓到的第一个真实 bug（W1）
@@ -262,8 +263,178 @@ Previous read of size 8 by T1:   pthread_cond_signal    (通知中)
 
 ---
 
-## 六、下一步（W2）
+## 六、W2 设计取舍（MemTable / SkipList / WriteBatch / WAL）
 
-- `SkipList`：手写，节点内存内联布局（next 指针数组与 key 放同一块内存，缓存友好）
-- `MemTable`：基于 SkipList + Arena，所有节点从 Arena 分配
-- `LookupKey`：利用 InternalKey 编码实现零拷贝的查找键
+W2 的目标很朴素：**让引擎第一次"能写入并持久化"**。
+一个 `WriteBatch` 先写进内存 `MemTable`（SkipList），再顺序追加到 WAL，
+崩溃后靠 WAL 重放恢复。这一周把"写路径"完整打通。
+
+### 6.1 `SkipList` —— 手写，缓存友好的内联节点
+
+**为什么不用 `std::map` / `std::unordered_map`**：
+- 红黑树节点前向/后向指针 + 颜色 + 堆分配，内存碎片严重；
+- 哈希表要算 hash、解决冲突，且无法做"范围扫描"（MemTable 必须支持 `Seek`）；
+- LSM-Tree 的 MemTable 读多写多、需要有序遍历，SkipList 是教科书级选择。
+
+**节点内存布局（关键优化）**：
+```cpp
+struct Node {
+  const Key key;
+  Node* next_[1];   // 柔性数组：实际长度 = height
+};
+```
+`key` 与 `next_` 放在**同一块内存**里，一次 cache line 命中就能拿到
+key 和指针，对跳表"自上而下再水平"的访问模式极其友好。
+节点用 placement new 在 Arena 上分配，`height` 决定 `next_` 的真实长度
+（`sizeof(Node) + (height-1)*sizeof(Node*)`）。
+
+**层高随机化**：每层以 1/4 概率再升一层（`rnd() < (1<<31)/4`），
+期望层高 ≈ 1/(1-1/4) = 1.33，最大 12 层可覆盖 2^24 个节点。
+用确定性 LCG（linear congruential generator）而非 `std::rand()`：
+测试可复现，排查并发/崩溃问题时不背"随机种子"的额外变量。
+
+**无锁读**：每个 `next_[i]` 是 `std::atomic<Node*>`，`FindGreaterOrEqual`
+全程只做 `load(std::memory_order_acquire)`，**完全不加锁**。
+写线程在插入时先 `NoBarrier_SetNext`（发布前用 relaxed 写指针），
+最后用 `release` 把新节点"挂"到前一层的 `next_`，读线程靠 acquire 看到。
+本阶段 MemTable 仍由单个写锁保护（见 6.2），SkipList 的并发语义
+为 W3 放开写锁、W8 后台 Compaction 并发读打好基础。
+
+> 踩坑：Clang 会对 GNU 柔性数组扩展报警（`-Wgnu-flexible-array-extensions`），
+> 用 `#pragma` 仅在 Clang 下抑制；GCC 下该写法本就合法，不影响零警告目标。
+
+### 6.2 `MemTable` —— SkipList + Arena + 引用计数
+
+**三个核心机制**：
+
+1. **引用计数（`Ref` / `Unref`）**：MemTable 同时被三条线持有 ——
+   前台写线程（正在写）、后台 flush 线程（正在落盘）、读线程（快照读）。
+   用 `atomic<int> refs_` 计数，归零时 `delete this`。这正是 W1 锚点 7
+   为"flush / compact / read 三线并发时不 UAF"预留的接口。
+
+2. **写锁保护**：`Add` / `Get` 都先 `Lock()`。本阶段只放一把互斥锁，
+   正确性优先；**W3 会改成 Group Commit（多个写请求合并一次 fsync）+ 放开锁**，
+   把单锁的串行瓶颈打开。
+
+3. **MVCC 快照读**：`Get` 时传入 `sequence`，只返回 `seq <= snapshot`
+   的最新版本。查找键用 `LookupKey` 编码（见 6.3），
+   跳表里第一个 user_key 匹配且 `seq <= snapshot` 的项就是答案；
+   遇到 `kTypeDeletion` 墓碑则视为不存在。
+
+**记录编码**（`Add` 写入跳表的内容）：
+```
+| varint(ik_size) | internal_key (user_key + 7B seq + 1B type) | varint(val_size) | value |
+```
+整条记录从 Arena 分配，key 与 value 都内联在节点里，没有额外堆分配。
+
+> 踩坑：最初 `Get` 误用 `comparator_->CompareUserKey(internal_key, user_key)`，
+> 但 `CompareUserKey` 会对**两个参数都调用 `ExtractUserKey`**（要求二者都是内部键）。
+> 把裸 `user_key`（如 `"foo"` 3 字节）喂进去会触发 `ExtractUserKey` 的
+> 长度断言。修复：直接 `user_comparator()->Compare(ExtractUserKey(internal_key), user_key)`。
+> ASAN 没报越界，说明这是逻辑错而非堆损坏 —— 印证了"断言比 sanitizer 更早抓到语义错误"。
+
+### 6.3 `LookupKey` —— 零拷贝查找键
+
+`Get` 时用户只给 `user_key` + `sequence`，但跳表按 `InternalKey` 排序。
+`LookupKey` 在栈上把二者拼成一条完整内部键：
+```
+| varint(ik_size) | user_key | packed(seq, kTypeValue) |
+```
+- `memtable_key()`：带 varint 长度前缀，用于跳表 `FindGreaterOrEqual`
+  （前缀让"第一个 >= 的"比较一次完成，不用反复算长度）；
+- `internal_key()`：去掉长度前缀，做精确的 user_key 比较与 sequence 比较；
+- `user_key()`：做前缀截断比较。
+三档视图指向同一块缓冲，零拷贝。
+
+### 6.4 `WriteBatch` —— 把"一批写"当成一个原子单位
+
+W1 锚点 5 定死：**WAL 以 `WriteBatch` 为记录单位**。
+这样要么一批全部恢复、要么全不恢复，是后续加事务（原子性）的地基。
+
+**格式**：
+```
+| sequence (8B) | count (4B) | [ Put/Delete 记录 ]* |
+```
+每条记录：`| tag(1B) | varint(key_len) | key | varint(val_len) | value |`。
+
+**两个关键设计**：
+- `Handler` 回调接口：`Iterate` 遍历每条记录时通过 `Put`/`Delete` 回调出去，
+  `MemTableInserter`（实现 `Handler`）把它插进 MemTable。
+  这样 WriteBatch 本身不依赖 MemTable 的具体类型，**解耦**。
+- `InsertInto` / `Append`：恢复时把写批里的记录逐个插回 MemTable；
+  `Append` 把两个写批拼接成更大的批（Group Commit 用）。
+
+`WriteBatchInternal` 作为友元藏在 `write_batch.h` 里，
+提供 `SetSequence` / `Sequence` 等"只有 DB 才该调"的内部操作，
+把批量写入的序列号分配逻辑从用户 API 里隔离出来。
+
+### 6.5 `WAL` —— 预写日志：崩溃后绝不丢数据
+
+**物理记录格式**：
+```
+每个分片： | crc32c(4B, 小端) | length(2B, 小端) | type(1B) | data(length 字节) |
+文件按 kBlockSize = 32KB 切块。
+```
+**为什么要切块 + 分片（FIRST / MIDDLE / LAST）**：
+WAL 是纯追加日志。崩溃往往发生在"写到一半"，最后一个块可能只有半个 record。
+把文件切成固定块、每条 record 最多填满块内剩余空间，放不下的切成分片，
+下一分片从新块开头继续。这样"半条 record"只影响最后一个块，
+前面的分片仍能拼回完整 record —— **崩溃恢复只需处理最后一个不完整的块**，复杂度常数级。
+
+**Reader 的重组逻辑**（核心难点）：
+`ReadPhysicalRecord` 按块读出 `[header|data]`，`ReadRecord` 用状态机把
+`FIRST → MIDDLE* → LAST` 拼回一条逻辑 record。遇到 `kZeroType`（块内填充）跳过，
+遇到 `EOF`（最后一个不完整块）正常结束而非报错，遇到 crc 失配通过 `Reporter`
+上报并停止。
+
+> 踩坑（W2 最隐蔽的 bug，花了一轮才定位）：
+> `ReadPhysicalRecord` 里 `*result = Slice(buffer_.data(), length)` 指向的是
+> **头部**，不是数据 —— 因为修复"长度检查顺序"时我把 `remove_prefix(kHeaderSize)`
+> 合并成了 `remove_prefix(kHeaderSize + length)`，却忘了 result 应当跳过头部。
+> 正确写法（LevelDB 同款）：`Slice(buffer_.data() + kHeaderSize, length)`。
+> 这个 bug 表现为"读到的数据是头部字节、crc 校验随机失配"，且失败记录不固定
+> （取决于后续数据），典型的"静默数据损坏"，靠 ASAN 都不一定抓得到，
+> 最终是标准校验向量 + 大记录往返测试暴露的。
+
+### 6.6 `CRC32C` —— 为什么 WAL 要有校验和，以及"标准值"的坑
+
+**为什么需要**：WAL 是唯一一道"掉电也能恢复"的防线。磁盘/文件系统会悄悄篡改数据
+（写到一半掉电的半个块、SSD 静默扇区损坏）。没有校验和，恢复时会把损坏字节
+当成合法记录，造成数据错误而非崩溃；有校验和，坏 record 变成一次明确的
+`Corruption` 错误，可安全跳过。
+
+**为什么是 CRC32C 而不是简单异或**：单字节校验只能发现奇数个比特翻转，
+对"整段被零覆盖"完全无能为力。CRC32C 对突发错误极其敏感，能检出所有
+<= 32 位突发错误，且 SSE4.2 有硬件指令 `crc32`。
+
+**算法约定（踩坑重灾区）**：
+CRC32C 的标准校验向量是 `"123456789" -> 0xE3069283`，
+但这是**反射（LSB-first）算法 + init=0xFFFFFFFF + xorout=0xFFFFFFFF** 的结果。
+我第一版写成了 MSB-first（非反射）表，即便加上 init/xorout 也只得到
+`0x05440F15`；而 init=0、xorout=0 的"裸"MSB-first 值是 `0xC052A8C8`
+—— 两者都不是 `0xE3069283`。
+
+最终采用与 SSE4.2 一致的**反射实现**：
+- 查表多项式用反射形式 `0x82F63B78`（即 Castagnoli `0x1EDC6F41` 按位反射）；
+- `Extend` 进入寄存器前 `crc ^= 0xFFFFFFFFu`，结束时再 `^= 0xFFFFFFFFu`；
+- 这样 `Value("123456789") == 0xE3069283`，且与硬件指令语义对齐，
+  将来可无修改地替换为 `_mm_crc32_u8`。
+
+`crc32c_test.cpp` 的 `StandardCheckValue` 就用这个向量守着算法约定，
+确保"查表方向 / init / xorout"任一写错都会立刻红。
+
+---
+
+## 七、下一步（W3）
+
+写路径已通，但还有两处明显瓶颈，W3 集中攻坚：
+
+- **Group Commit**：把多个并发写请求合并成一次 WAL `fsync`，
+  fsync 在机械盘上可达毫秒级，是写入路径主要开销；合并后通常一个数量级 QPS 提升。
+  复用 W2 已落地的 `WriteBatch::Append` 做批拼接。
+- **放开 MemTable 读写锁**：当前 `Add` / `Get` 共用一把互斥锁，写会阻塞读。
+  改为"写串行、读无锁"（SkipList 的 acquire/release 语义已就位），
+  让快照读完全不被前台写阻塞。
+
+之后才会进入读路径（SSTable / Block / Bloom Filter / 版本集 / Compaction），
+那是 W4 及以后。

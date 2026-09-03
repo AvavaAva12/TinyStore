@@ -209,14 +209,43 @@ inline void PutLengthPrefixedSlice(std::string* dst, const Slice& value) {
 }
 
 inline bool GetLengthPrefixedSlice(Slice* input, Slice* result) {
-    uint32_t len = 0;
-    // 长度字段本身残缺，或 payload 不足 -> 视为数据截断
-    if (!GetVarint32(input, &len) || input->size() < len) {
-        return false;
+  uint32_t len = 0;
+  // 长度字段本身残缺，或 payload 不足 -> 视为数据截断
+  if (!GetVarint32(input, &len) || input->size() < len) {
+    return false;
+  }
+  *result = Slice(input->data(), len);
+  input->remove_prefix(len);
+  return true;
+}
+
+// 从裸指针解析一个长度前缀 Slice，**不做边界检查**。
+//
+// 【为什么需要它】
+// MemTable 的 SkipList 节点里，key 是一个指向 arena 中「记录缓冲区」的裸指针，
+// 记录格式为 [varint(ik_size)][internal_key][varint(val_size)][value]。
+// 比较器只需要取出 internal_key 部分来比较，但调用方手里只有一个 const char*，
+// 既不知道整条记录的总长度，也不该用 Slice(const char*) 按 strlen 构造
+// （记录不是以 '\0' 结尾的字符串，strlen 会越界读到别的内存）。
+//
+// 因此这里提供一个「信任缓冲区有效」的过载：它只解析 varint 长度，
+// 再返回紧随其后的 payload Slice。arena 里的记录一定是完整有效的，
+// 所以跳过边界检查既正确又省一次长度探测。
+inline Slice GetLengthPrefixedSlice(const char* ptr) {
+  const unsigned char* p = reinterpret_cast<const unsigned char*>(ptr);
+  uint32_t len = 0;
+  uint32_t shift = 0;
+  while (true) {
+    const unsigned char byte = *p++;
+    if (byte & 0x80) {
+      len |= (static_cast<uint32_t>(byte & 0x7f) << shift);
+      shift += 7;
+    } else {
+      len |= (static_cast<uint32_t>(byte) << shift);
+      break;
     }
-    *result = Slice(input->data(), len);
-    input->remove_prefix(len);
-    return true;
+  }
+  return Slice(reinterpret_cast<const char*>(p), len);
 }
 
 }  // namespace tinystore
