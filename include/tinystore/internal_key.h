@@ -184,7 +184,7 @@ private:
 // 这是"装饰器模式"在系统编程中的一个典型应用：
 // 用户只关心 user_key 怎么比，引擎负责在其之上叠加 sequence 的规则。
 // ---------------------------------------------------------------------------
-class InternalKeyComparator {
+class InternalKeyComparator : public Comparator {
 public:
     explicit InternalKeyComparator(const Comparator* user_comparator)
         : user_comparator_(user_comparator) {}
@@ -206,6 +206,29 @@ public:
 
     // 用于持久化到 SSTable 元数据，防止用错比较器打开数据库
     const char* Name() const;
+    // 分隔键 / 后继键只能压缩 user_key 部分，绝不能拿整个 InternalKey 去调
+    // user_comparator_（会把 8 字节后缀一起压缩，产生长度 < 8 的非法 InternalKey，
+    // 读路径解码后缀时 size - 8 下溢、Slice 越界 → 段错误）。压缩后再用最大
+    // (seq, type) 拼回合法 InternalKey，使其排在原 user_key 所有版本之后、小于下一 user_key。
+    void FindShortestSeparator(std::string* start, const Slice& limit) const override {
+        Slice user_start = ExtractUserKey(*start);
+        Slice user_limit = ExtractUserKey(limit);
+        std::string tmp(user_start.data(), user_start.size());
+        user_comparator_->FindShortestSeparator(&tmp, user_limit);
+        if (tmp.size() < user_start.size() &&
+            user_comparator_->Compare(user_start, Slice(tmp)) < 0) {
+            *start = InternalKey(tmp, kMaxSequenceNumber, kTypeValue).Encode().ToString();
+        }
+    }
+    void FindShortSuccessor(std::string* key) const override {
+        Slice user_key = ExtractUserKey(*key);
+        std::string tmp(user_key.data(), user_key.size());
+        user_comparator_->FindShortSuccessor(&tmp);
+        if (tmp.size() < user_key.size() &&
+            user_comparator_->Compare(user_key, Slice(tmp)) < 0) {
+            *key = InternalKey(tmp, kMaxSequenceNumber, kTypeValue).Encode().ToString();
+        }
+    }
 
 private:
     const Comparator* user_comparator_;

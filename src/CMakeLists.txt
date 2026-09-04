@@ -20,6 +20,10 @@ add_library(tinystore STATIC
     write_batch.cpp
     log_writer.cpp
     log_reader.cpp
+    block.cpp
+    filter_policy.cc
+    table.cpp
+    version_set.cpp
     db.cpp
 )
 

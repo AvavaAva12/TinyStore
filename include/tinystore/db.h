@@ -4,6 +4,7 @@
 
 #include "tinystore/comparator.h"
 #include "tinystore/env.h"
+#include "tinystore/filter_policy.h"
 #include "tinystore/status.h"
 
 namespace tinystore {
@@ -26,6 +27,22 @@ struct Options {
 
   // 数据库目录已存在则报错（防止误打开别人的库，覆盖其数据）
   bool error_if_exists = false;
+
+  // --- W4：持久化层调参 ---
+
+  // MemTable 达到此大小（字节）就触发 flush 成 SSTable。默认 4MB。
+  // 越大：flush 次数少、写放大低，但崩溃后要重放的 WAL 更长、内存占用更高。
+  size_t write_buffer_size = 4 * 1024 * 1024;
+
+  // SSTable 单个数据块的目标大小（约值）。默认 4KB：块越大随机读 IO 更贵、
+  // 但索引更小；块越小定位越精细、过滤收益更高。
+  size_t block_size = 4096;
+
+  // 布隆过滤器策略（每 key 约 10 bit 时误报率 ~1%）。默认开启内置布隆。
+  // 默认是进程级单例（借用、不拥有），所以 Options 可以随意值拷贝而不泄漏；
+  // 想要自定义参数时，用 NewBloomFilterPolicy 自建并自行 delete。
+  // 设置 nullptr 可关闭，以便对比"无过滤"时的读放大。
+  const FilterPolicy* filter_policy = DefaultFilterPolicy();
 };
 
 // ===========================================================================

@@ -231,5 +231,133 @@ TEST(DBTest, EmptyWriteIsNoop) {
   RemoveAll(name);
 }
 
+// ---- W4：flush 把 MemTable 落盘成 SSTable；重开后数据应从 SSTable 读出 ----
+
+// 用极小的 write_buffer_size 强制触发 flush，写入远超缓冲的数据，
+// 关闭后重新打开，验证所有数据仍在（且至少部分已落在 SSTable 而非仅 WAL）。
+TEST(DBTest, FlushPersistsAcrossReopen) {
+  Options opt;
+  opt.create_if_missing = true;
+  opt.write_buffer_size = 1024;  // 1KB：几个写后就触发 flush
+  const std::string name = TempDbName("flush");
+  RemoveAll(name);
+
+  {
+    DB* db;
+    ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+    const int n = 2000;
+    for (int i = 0; i < n; ++i) {
+      ASSERT_TRUE(db->Put("k" + std::to_string(i), "v" + std::to_string(i)).ok());
+    }
+    delete db;
+  }
+  {
+    DB* db2;
+    ASSERT_TRUE(DB::Open(opt, name, &db2).ok());
+    for (int i = 0; i < 2000; ++i) {
+      std::string got;
+      ASSERT_TRUE(db2->Get("k" + std::to_string(i), &got).ok()) << "missing " << i;
+      ASSERT_EQ(got, "v" + std::to_string(i));
+    }
+    // 删除一个键，再重开仍应读不到（墓碑也要能持久化）
+    ASSERT_TRUE(db2->Delete("k" + std::to_string(1234)).ok());
+    std::string got;
+    ASSERT_TRUE(db2->Get("k" + std::to_string(1234), &got).IsNotFound());
+    delete db2;
+  }
+  RemoveAll(name);
+}
+
+// flush 之后，新写的数据走新的 WAL + 新 MemTable，旧数据在 SSTable；
+// 混合读写验证"MemTable 最新 + SSTable 兜底"的合并读正确。
+TEST(DBTest, ReadSpanningMemTableAndSSTable) {
+  Options opt;
+  opt.create_if_missing = true;
+  opt.write_buffer_size = 1024;
+  const std::string name = TempDbName("mixed");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  // 第一组：写足触发 flush，全部进入 SSTable
+  for (int i = 0; i < 1500; ++i) {
+    ASSERT_TRUE(db->Put("old" + std::to_string(i), "o" + std::to_string(i)).ok());
+  }
+  // 第二组：再写一批（部分仍在 MemTable，部分又 flush）
+  for (int i = 0; i < 500; ++i) {
+    ASSERT_TRUE(db->Put("new" + std::to_string(i), "n" + std::to_string(i)).ok());
+  }
+  // 覆盖一个 old 键，验证 SSTable 里的旧版本被 MemTable 里的新版本盖过
+  ASSERT_TRUE(db->Put("old777", "OVERWRITTEN").ok());
+
+  for (int i = 0; i < 1500; ++i) {
+    std::string got;
+    ASSERT_TRUE(db->Get("old" + std::to_string(i), &got).ok()) << "old missing " << i;
+  }
+  std::string overwritten;
+  ASSERT_TRUE(db->Get("old777", &overwritten).ok());
+  ASSERT_EQ(overwritten, "OVERWRITTEN");
+  for (int i = 0; i < 500; ++i) {
+    std::string got;
+    ASSERT_TRUE(db->Get("new" + std::to_string(i), &got).ok()) << "new missing " << i;
+  }
+
+  delete db;
+  RemoveAll(name);
+}
+
+TEST(DBTest, ConcurrentWritesWithFlushes) {
+  Options opt;
+  opt.create_if_missing = true;
+  opt.write_buffer_size = 4096;
+  const std::string name = TempDbName("concflush");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  const int nthreads = 8;
+  const int per_thread = 300;
+  std::vector<std::thread> threads;
+  for (int t = 0; t < nthreads; ++t) {
+    threads.emplace_back([&, t]() {
+      for (int i = 0; i < per_thread; ++i) {
+        const std::string key = "k" + std::to_string(t) + "_" + std::to_string(i);
+        const std::string val = "v" + std::to_string(i);
+        EXPECT_TRUE(db->Put(Slice(key), Slice(val)).ok());
+        std::string got;
+        EXPECT_TRUE(db->Get(Slice(key), &got).ok());
+        EXPECT_EQ(got, val);
+      }
+    });
+  }
+  for (auto& th : threads) th.join();
+
+  for (int t = 0; t < nthreads; ++t) {
+    for (int i = 0; i < per_thread; ++i) {
+      const std::string key = "k" + std::to_string(t) + "_" + std::to_string(i);
+      std::string got;
+      ASSERT_TRUE(db->Get(Slice(key), &got).ok()) << "missing " << key;
+      ASSERT_EQ(got, "v" + std::to_string(i));
+    }
+  }
+
+  // 重开验证持久化（覆盖 flush 路径）
+  delete db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+  for (int t = 0; t < nthreads; ++t) {
+    for (int i = 0; i < per_thread; ++i) {
+      const std::string key = "k" + std::to_string(t) + "_" + std::to_string(i);
+      std::string got;
+      ASSERT_TRUE(db->Get(Slice(key), &got).ok()) << "missing after reopen " << key;
+      ASSERT_EQ(got, "v" + std::to_string(i));
+    }
+  }
+
+  delete db;
+  RemoveAll(name);
+}
+
 }  // namespace
 }  // namespace tinystore

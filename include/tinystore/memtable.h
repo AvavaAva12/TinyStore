@@ -90,6 +90,17 @@ public:
   MemTable& operator=(const MemTable&) = delete;
 
   void Ref() { refs_.fetch_add(1, std::memory_order_relaxed); }
+  // RCU 风格尝试引用：仅当对象还活着（refs>0）时才加引用并返回 true。
+  // 供读路径在 flush 换表的瞬间无锁地安全取用 MemTable。
+  bool TryRef() const {
+    int c = refs_.load(std::memory_order_relaxed);
+    while (c != 0) {
+      if (refs_.compare_exchange_weak(c, c + 1, std::memory_order_acq_rel,
+                                      std::memory_order_relaxed))
+        return true;
+    }
+    return false;
+  }
   void Unref() {
     if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) delete this;
   }
@@ -102,8 +113,10 @@ public:
   //   OK + 填充 *value   —— 找到快照可见的最新有效值
   //   NotFound           —— 该 key 不存在，或最新可见版本是删除（墓碑）
   //   Corruption         —— internal_key 无法解析（不应发生，除非内存损坏）
+  // found（可选）：若非 null，key 在 MemTable 中存在（值或删除）则置 true，
+  //   供 DB::Get 区分"memtable 里的删除"与"memtable 里根本没有"（后者需继续查 SSTable）。
   Status Get(const Slice& user_key, SequenceNumber snapshot,
-             std::string* value) const;
+             std::string* value, bool* found = nullptr) const;
 
   // 近似内存占用（节点 + 记录，均由 Arena 统计）
   size_t ApproximateMemoryUsage() const { return arena_.MemoryUsage(); }
@@ -137,7 +150,7 @@ private:
   InternalKeyComparator const* const comparator_;
   Arena arena_;
   SkipList<const char*, MemTableKeyComparator> table_;
-  std::atomic<int> refs_;
+  mutable std::atomic<int> refs_;
   // 只保护"写"路径。读路径（Get）走跳表的无锁读，不取这把锁——
   // 这样快照读完全不被前台写阻塞（见 W3 设计笔记）。跳表本身假设"单写者"，
   // 因此 Add 必须串行（由 DB 的写者队列或这把锁保证），Get 则可多读者并发。

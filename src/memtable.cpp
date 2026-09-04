@@ -39,7 +39,8 @@ void MemTable::Add(SequenceNumber seq, ValueType type, const Slice& key,
 }
 
 Status MemTable::Get(const Slice& user_key, SequenceNumber snapshot,
-                     std::string* value) const {
+                     std::string* value, bool* found) const {
+  if (found != nullptr) *found = false;
   LookupKey lkey(user_key, snapshot);
 
   // 无锁读：跳表的 next 指针是 atomic（release 发布 / acquire 读取），
@@ -69,6 +70,7 @@ Status MemTable::Get(const Slice& user_key, SequenceNumber snapshot,
     return Status::Corruption("memtable: malformed internal key");
   }
   if (parsed.type == kTypeDeletion) {
+    if (found != nullptr) *found = true;  // key 在 memtable，但最新可见是删除
     return Status::NotFound("memtable: key deleted");
   }
 
@@ -76,6 +78,7 @@ Status MemTable::Get(const Slice& user_key, SequenceNumber snapshot,
   const char* val_ptr = internal_key.data() + internal_key.size();
   Slice val = GetLengthPrefixedSlice(val_ptr);
   *value = val.ToString();
+  if (found != nullptr) *found = true;  // key 确实在 memtable（有效值）
   return Status::OK();
 }
 

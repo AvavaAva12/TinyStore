@@ -7,28 +7,18 @@
 #include <string>
 
 #include "tinystore/db.h"
-#include "tinystore/env.h"
 #include "tinystore/internal_key.h"
 #include "tinystore/log_reader.h"
 #include "tinystore/log_writer.h"
 #include "tinystore/memtable.h"
+#include "tinystore/version_set.h"
 #include "tinystore/write_batch.h"
 
 namespace tinystore {
 
 // ===========================================================================
-// Group Commit 的写请求单元
+// Group Commit 的写请求单元（与 W3 相同）
 // ===========================================================================
-//
-// 每个调用 Write 的线程在栈上创建一个 Writer，把自己的 batch 挂上去，
-// 然后把指针塞进 DBImpl::writers_ 队列等待提交：
-//   * 若自己是队首 -> 成为 leader，负责把整组合并、写 WAL、回放 MemTable，
-//     最后挨个唤醒同组的 follower；
-//   * 若自己不是队首 -> 有别的 leader 在干活，安静等 leader 唤醒即可
-//     （leader 会把本请求的 batch 一起提交，结果填进 status）。
-//
-// 这样多个并发写入共享"一次 WAL 追加 + 一次 fsync"，把毫秒级的 fsync 开销
-// 摊薄到整组，通常带来数量级的写入 QPS 提升（见 W3 设计笔记）。
 struct Writer {
   const WriteBatch* batch = nullptr;  // 本请求要写的 batch（只读，leader 不改它）
   Status status;                     // leader 填好的提交结果（同组共享）
@@ -37,8 +27,19 @@ struct Writer {
 };
 
 // ===========================================================================
-// DBImpl —— DB 的具体实现
+// DBImpl —— DB 的具体实现（W4：接上持久化层）
 // ===========================================================================
+//
+// W4 在 W3 的写路径之上，把 MemTable 周期性 flush 成不可变 SSTable：
+//   * 写：Group Commit 落到 WAL（一次 fsync）+ 回放 MemTable（同 W3）；
+//   * flush：MemTable 超过 write_buffer_size 时整体写成一个 SSTable，登记进
+//     VersionSet（MANIFEST 落盘），并滚动到新的 WAL；
+//   * 读：先查 MemTable，未命中再按"从新到旧"扫描 SSTable 文件，合并出最新可见版本；
+//   * 恢复：Open 时重放 MANIFEST 重建 Version（SSTable 集合 + 当前 WAL 编号），
+//     再重放当前 WAL 把未 flush 的数据填回 MemTable。
+//
+// 读路径全程无锁：memtable 与 Version 都用 RCU 风格的 TryRef 安全取引用，
+// SSTable 读取走 pread（线程安全），与 W3 的"无锁快照读"一脉相承。
 class DBImpl : public DB {
 public:
   DBImpl(const Options& options, const std::string& name);
@@ -49,34 +50,37 @@ public:
   Status Get(const Slice& key, std::string* value) override;
   Status Write(const WriteBatch& batch) override;
 
-  // 从 WAL 恢复 MemTable，并新建一条可写的 WAL。由 DB::Open 调用。
+  // 从 MANIFEST 恢复 Version + 当前 WAL 编号，重放 WAL，建立可写 WAL。
   Status Recover();
 
 private:
+  // 把活跃 MemTable flush 成一个 SSTable（登记进版本），并滚动 WAL。
+  // 必须在持有 mutex_ 的写者（leader）上下文中调用。
+  Status CompactMemTable();
+
   Env* env_;
   const Comparator* user_comparator_;
   InternalKeyComparator icmp_;
+  Options options_;  // 持久化层调参（filter_policy / block_size / write_buffer_size）
   std::string dbname_;
-  std::string wal_name_;  // 当前 WAL 文件名（W3 单文件，W4 起会按序号滚动）
 
-  // --- 写路径同步 ---
-  // mutex_ 只用于：保护 writers_ 队列 + 把"WAL 追加 + fsync + 回放"串化成单写者。
-  // 它**不**保护读路径——Get 通过 mem_ / last_sequence_ 的 atomic 无锁完成。
+  // --- 写路径同步（同 W3）---
   std::mutex mutex_;
   std::condition_variable cv_;
-  std::deque<Writer*> writers_;  // GUARDED_BY(mutex_)
+  std::deque<Writer*> writers_;
 
   // --- 内存状态（读路径无锁访问）---
-  // 当前活跃 MemTable。W3 不做 flush，整个生命周期稳定；W4 引入 flush 后，
-  // 这里会换成"可原子切换"的指针（immutable MemTable 入队落盘）。
-  std::atomic<MemTable*> mem_{nullptr};
-  // 已提交的最大 sequence。写者用 release 在"内存已落好"之后发布，
-  // 读者用 acquire 读到它时，保证能看到对应的 MemTable 内容（MVCC 快照读基础）。
+  std::atomic<MemTable*> mem_{nullptr};  // 活跃 MemTable；flush 时 RCU 换出
   std::atomic<SequenceNumber> last_sequence_{0};
 
   // --- WAL ---
-  log::Writer* log_ = nullptr;  // 不拥有 dest_
-  WritableFile* logfile_ = nullptr;
+  WritableFile* logfile_ = nullptr;  // 活跃 WAL（不拥有，析构时关闭）
+  log::Writer* log_ = nullptr;
+  uint64_t logfile_number_ = 0;
+  std::string wal_name_;
+
+  // --- 版本 / MANIFEST ---
+  VersionSet* versions_ = nullptr;  // 拥有
 };
 
 }  // namespace tinystore

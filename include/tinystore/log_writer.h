@@ -42,7 +42,10 @@ constexpr int kHeaderSize = 4 + 2 + 1;  // crc + length + type
 class Writer {
 public:
   // dest 的生命周期由调用方负责，Writer 不拥有它。
-  explicit Writer(WritableFile* dest) : dest_(dest), block_offset_(0) {}
+  // block_offset：在已有文件（如重放后的 MANIFEST / WAL）上续写时，
+  // 传入当前文件大小对 kBlockSize 取模，使新记录从正确的块内偏移继续。
+  explicit Writer(WritableFile* dest, uint64_t block_offset = 0)
+      : dest_(dest), block_offset_(static_cast<int>(block_offset % kBlockSize)) {}
 
   Writer(const Writer&) = delete;
   Writer& operator=(const Writer&) = delete;
