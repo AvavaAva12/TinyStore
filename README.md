@@ -5,8 +5,13 @@
 目标不是"做一个能用的数据库"，而是**把内存、并发、文件 I/O、性能工程这四类
 硬骨头逐个啃一遍**，并且每个知识点都能被追问三层。
 
-> 设计决策与踩坑记录见 [`docs/design-notes.md`](docs/design-notes.md) ——
-> 那份文档是本项目最重要的资产。
+> **文档**
+>
+> | 文档 | 内容 |
+> |---|---|
+> | [`docs/architecture.md`](docs/architecture.md) | **架构总览**：三条主路径的数据流、模块分层、**文件格式精确规格**、W4~W9 关键决策、配置项、已知限制 |
+> | [`docs/design-notes.md`](docs/design-notes.md) | **设计取舍与踩坑记录**（W1~W3，含实测性能数据与 TSAN 抓到的真实 bug）——面试素材 |
+> | [`docs/code-review.md`](docs/code-review.md) | **代码审查报告**：已验证的缺陷、证伪记录、修复优先级 |
 
 ---
 
@@ -85,9 +90,31 @@ TinyStore/
 ├── src/                   # 实现
 ├── tests/                 # 单元测试（每个模块一个独立可执行文件）
 ├── benchmarks/            # 微基准测试
+├── tools/                 # 开发辅助脚本（TSAN 在 WSL2 下的运行方式）
 ├── cmake/                 # 编译选项与 Sanitizer 配置
-└── docs/design-notes.md   # 设计笔记（面试素材）
+└── docs/
+    ├── architecture.md    # 架构总览：数据流 / 文件格式 / 关键决策
+    ├── design-notes.md    # 设计取舍与踩坑记录（W1~W3，面试素材）
+    └── code-review.md     # 代码审查报告
 ```
+
+---
+
+## 已知限制
+
+**这些是已确认存在的缺陷，不是待办清单。** 完整分析、证伪记录与修复优先级见 [`docs/code-review.md`](docs/code-review.md)。
+
+最需要留意的三条：
+
+| 问题 | 后果 |
+|---|---|
+| `CompactLevel` 选源文件时留下 `FileMetaData*` 悬垂指针 | 并发 flush/compaction 时 use-after-free，可能选错输入文件并丢数据 |
+| `NewIterator` 的 MemTable 引用在锁外建立 | 与并发 flush 交叠时 use-after-free（同文件的 `Get` 写法是对的，两条路径不一致） |
+| `log::Reader` 无法区分"读完"与"损坏" | MANIFEST **中段**损坏会让 `log_number` 回退，新 WAL 与已登记的 SSTable 被双向删除 → 丢数据且**全程无报错** |
+
+前两条都发生在 W7 把 compaction 挪到后台之后才成为常态（此前写路径单线程，窗口极窄）。它们长期未被发现的原因是**测试盲区**：迭代测试与并发测试分开跑，没有交叉覆盖。
+
+其余：`Block` 重启点数组无下界校验、metaindex 损坏被吞成"打开成功"、`max_level_bytes_multiplier=0` 整数除零、`create_if_missing` 选项未实现、`Close()` 返回值未检查、13 处 `DeleteFile` 未检查返回值，以及一批死代码与失真注释。
 
 ---
 
