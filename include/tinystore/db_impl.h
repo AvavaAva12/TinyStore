@@ -144,6 +144,29 @@ private:
   Options options_;  // 持久化层调参（filter_policy / block_size / write_buffer_size）
   std::string dbname_;
 
+  // 库级排他锁。持有它意味着"本进程是这个目录唯一的写入者"。
+  //
+  // 【为什么必须有】
+  // 两个进程同时打开同一个库目录时，各自维护独立的 MemTable 与 VersionSet，
+  // 并发写同一个 MANIFEST、互相删除对方的 SSTable。这个过程**没有任何报错**，
+  // 只是一路安静地把数据写坏——比崩溃更难排查。锁把这种"静默损坏"提前变成
+  // 一个明确的 Open 失败。
+  //
+  // 【锁的性质：内核级、进程退出自动释放】
+  // 用 Env::LockFile（POSIX flock）而非"创建一个 LOCK 文件当标志"：
+  //   * flock 由内核在进程退出（含 kill -9）时自动释放，不会留下永久死锁；
+  //   * LOCK_NB 拿不到锁立刻报错，而不是让用户莫名其妙地卡住；
+  //   * 加锁与"检查是否已存在"是同一个原子操作，不存在"检查-再打开"的竞态。
+  //
+  // 【已知局限：挡不住同进程内的重复打开】
+  // flock 锁的是"打开文件描述"而非进程，同一进程用两个不同 fd 打开同一文件
+  // 会各自获得自己的锁。因此同一进程里两次 Open 同一目录不会被拦下。
+  // 这不是缺陷而是 flock 的既定语义：真正的风险来自多个**进程**并发；
+  // 同进程重复 Open 同一目录本就没有意义，由调用方自己负责。
+  // 相应地，锁的测试也必须用两个真实进程来验证（见 crash_test.cpp）。
+  std::string lock_name_;
+  std::unique_ptr<FileLock> db_lock_;
+
   // --- 写路径同步（同 W3）---
   std::mutex mutex_;
   std::deque<Writer*> writers_;  // 等待提交的写请求队列（Group Commit）

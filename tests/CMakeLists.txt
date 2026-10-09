@@ -71,3 +71,33 @@ tinystore_add_test(db_test)
 tinystore_add_test(table_test)
 tinystore_add_test(filter_test)
 tinystore_add_test(iterator_test)
+
+# ---------------------------------------------------------------------------
+# 崩溃恢复测试
+#
+# 【为什么单独注册而不在 TSAN 下运行】
+# 它用 fork 制造"进程被杀"的场景。TSAN 无法跨 fork 跟踪内存访问：子进程里
+# 只有当前线程存在，TSAN 会把父进程遗留的所有分配与锁状态判为异常，
+# 产生大量与被测代码无关的误报。
+# 这不是掩盖问题：fork 本身被 TSAN 列为不支持的场景，且本测试验证的是
+# **持久化协议**（文件与 MANIFEST 的先后顺序），不依赖内存序，天然无竞争可查。
+# 其余三类竞争（读路径无锁、后台 compaction、Group Commit）已由 db_test
+# 在 TSAN 下覆盖。
+# ---------------------------------------------------------------------------
+if(NOT TINYSTORE_ENABLE_TSAN)
+    # 不复用 tinystore_add_test：本文件自带 main（要用同一个二进制以子进程身份
+    # fork+exec 自己），因此只链接 gtest 而不链接提供 main 的 gtest_main。
+    add_executable(crash_test crash_test.cpp)
+    target_link_libraries(crash_test
+        PRIVATE tinystore GTest::gtest tinystore_options)
+    set_target_properties(crash_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    if(TINYSTORE_TEST_PREFIX)
+        add_test(NAME crash_test
+                 COMMAND ${TINYSTORE_TEST_PREFIX} $<TARGET_FILE:crash_test>)
+    else()
+        add_test(NAME crash_test COMMAND crash_test)
+    endif()
+else()
+    message(STATUS "TSAN detected: skipping crash_test (fork is unsupported by TSAN)")
+endif()

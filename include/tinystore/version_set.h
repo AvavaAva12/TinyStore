@@ -42,6 +42,9 @@ std::string MakeFileName(const std::string& dbname, uint64_t number,
                           const char* suffix);
 std::string ManifestFileName(const std::string& dbname);
 
+// 库级排他锁文件。一个数据库目录同时只允许一个进程打开。
+std::string LockFileName(const std::string& dbname);
+
 // 解析文件名：<编号>.<后缀> -> 取前导数字部分。成功返回 true。
 bool ParseFileName(const std::string& name, uint64_t* number);
 

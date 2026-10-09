@@ -104,6 +104,7 @@ TinyStore/
 | **W6** | Compaction：Leveled 策略 + 墓碑回收 + TableCache 引用计数 | ✅ 完成 |
 | **W7** | Compaction 后台化：`Env::Schedule` + 生命周期安全等待 | ✅ 完成 |
 | **W8** | P1 收口：TableCache LRU 淘汰 + Snapshot 句柄 API + 迭代器反向遍历 + Compaction 优先级与限流 | ✅ 完成 |
+| **W9** | 可靠性：库级排他锁 + 崩溃恢复测试（崩溃注入点 + fork/exec） | ✅ 完成 |
 
 > 说明：原规划把「读路径 / BloomFilter」列为 W5、「Flush / Version / MANIFEST」列为 W6。
 > 实际执行时这两块内容合并进了 W4 一次提交（原 W5、W6 的条目已不再单列）。
@@ -113,13 +114,42 @@ TinyStore/
 
 | 优先级 | 主题 | 动机 / 现状缺口 |
 |---|---|---|
-| **P2** | **可靠性工程**：`TestEnv` 故障注入 + 崩溃一致性测试 | `env.h` 已预留 `EnvWrapper` 与 `Schedule`/`StartThread`，但尚未落地。需注入「第 N 次写失败 / 截断文件 / 损坏 CRC」等故障，验证恢复路径；以及真正的 `kill -9` 崩溃测试 |
-| **P2** | **文件锁**（`Env::LockFile`） | 接口已定义但未使用。缺少它，多进程同时打开同一目录会各自维护 MemTable 与 VersionSet 并并发写同一个 MANIFEST，直接损坏数据 |
 | **P2** | **MANIFEST 快照与压缩** | MANIFEST 目前只追加、从不压缩。W6 引入 compaction 后增删记录变频繁，长时间运行会无限增长，重放时间随之线性上升 |
 | **P2** | **多版本压缩（Compaction 选点优化）** | W8 已能按压力选层，但 L1→L2 仍是"整层全部文件参与"。真实负载下应改为按字节预算滚动选点，避免一次归并搬运整个层 |
+| **P2** | **WAL 半条记录的处理** | W9 已用 fork/exec 验证了"进程被杀"的恢复路径。尚未覆盖"记录写到一半"（尾部 CRC 或 payload 截断）——`log::Reader` 对残缺尾记录应当静默丢弃，但这条分支仍无测试 |
 | **P3** | **性能与可观测**：Block 缓存、统计信息、`Logger` 落地 | `ApproximateOffsetOf` 当前是简化版；`Logger` 接口存在但未接入。W8 已加了缓存条目数/字节数与写放大计数，可作为指标体系的起点 |
 | **P3** | **反向迭代的按键范围扫描** | W8 的 `Prev` 每次都要扫过该 user_key 的全部版本（总代价 O(总 entry 数)）。数据量上来后可加"范围反向扫描"接口，只在块边界回扫 |
 | **P4** | 可选扩展：`epoll` Reactor + RESP 协议、Raft 复制 | 网络层与分布式复制，属于加分项，不影响存储引擎主线 |
+
+### 库级排他锁（W9）
+
+`DB::Open` 会先抢 `<目录>/LOCK` 的 `flock`，抢不到直接返回错误。原因是两个进程同时打开同一目录时，各自维护独立的 MemTable 与 VersionSet，会并发写同一个 MANIFEST、互删对方的 SSTable——**全程无任何报错**，只是一路安静地把数据写坏，比崩溃更难排查。
+
+选 `flock` 而不是"创建一个 LOCK 文件当标志"的原因：
+
+- 进程退出（含 `kill -9`）时内核自动释放，不会留下永久死锁；
+- `LOCK_NB` 拿不到锁立刻报错，而非让调用方莫名卡住；
+- 加锁与"是否已被占用"是同一个原子操作，不存在"检查-再打开"的竞态窗口。
+
+**已知局限**：`flock` 锁的是"打开文件描述"而非进程，同一进程用两个不同 fd 打开同一文件会各自获得自己的锁。因此同进程内的重复 `Open` 不会被拦下——这是 flock 的既定语义，真正的风险来自多进程并发。相应地，锁的测试也用两个真实进程来验证。
+
+### 崩溃恢复测试（`crash_test`）
+
+用 `fork + exec` 制造真实的"进程被杀"，验证**已返回 OK 的写入在崩溃后绝不丢失**：
+
+| 崩溃点 | 考验的边界 |
+|---|---|
+| `kCrashPointAfterWalSync` | WAL 已 fsync 但内存视图未更新 → 恢复必须靠 WAL 重放找回 |
+| `kCrashPointAfterFlushSstWrite` | SSTable 已落盘但 MANIFEST 未登记 → 该文件是孤儿，必须被清理且数据仍能从旧 WAL 重放 |
+| `kCrashPointAfterFlushCommit` | MANIFEST 已提交但旧 WAL 未删 → 数据"两头都有"，恢复必须容忍重叠而非报错 |
+| `kCrashPointAfterCompactionOutput` | compaction 输出已落盘但未提交 → 源文件仍必须有效，否则**唯一持有数据的文件被当孤儿删掉** |
+
+两个必须用 `fork + exec` 而非单纯 `fork` 的原因（踩过才知道）：
+
+1. **Env 的后台线程池是进程级单例**。`fork` 只复制调用线程，子进程里线程池对象还在但执行线程不存在 → 子进程析构 DB 时 `WaitForBackgroundCompaction()` 投的 barrier 任务永远没人执行，直接死锁；更糟的是 compaction 根本不会跑，崩溃点打不到。
+2. **`setenv` 不能用于父子传参**。它会调 `malloc`，而 fork 后子进程继承了其他线程的 malloc 锁状态。改用 `argv`（fork 前就备好字符串）+ `execv`，全程只读访问。
+
+TSAN 下不运行此测试：TSAN 无法跨 fork 跟踪访问，会产生大量与被测代码无关的误报。它验证的是**持久化协议**（文件与 MANIFEST 的先后顺序），本身不依赖内存序。
 
 ---
 

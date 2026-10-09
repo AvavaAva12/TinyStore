@@ -23,6 +23,8 @@ std::string ManifestFileName(const std::string& dbname) {
   return dbname + "/MANIFEST";
 }
 
+std::string LockFileName(const std::string& dbname) { return dbname + "/LOCK"; }
+
 bool ParseFileName(const std::string& name, uint64_t* number) {
   const size_t dot = name.rfind('.');
   if (dot == std::string::npos || dot == 0) return false;

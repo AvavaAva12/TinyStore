@@ -25,6 +25,8 @@ add_library(tinystore STATIC
     table.cpp
     version_set.cpp
     db.cpp
+    # 崩溃注入点（仅测试使用；生产路径上是恒为 false 的原子读）
+    test_util.cpp
 )
 
 target_include_directories(tinystore

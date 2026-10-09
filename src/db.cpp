@@ -10,6 +10,7 @@
 
 #include "tinystore/internal_key.h"
 #include "tinystore/table.h"
+#include "tinystore/test_util.h"
 #include "tinystore/version_set.h"
 
 namespace tinystore {
@@ -105,6 +106,11 @@ DBImpl::~DBImpl() {
     m->Unref();  // 释放 DB 持有的引用
   }
   delete versions_;
+
+  // 最后释放库级锁。放在最后是刻意的：只要还在清理资源（删版本集、等后台任务），
+  // 就不该让另一个进程以为"这个库已经没人用了"而进来抢写。
+  // unique_ptr 的析构会调 UnlockFile（flock LOCK_UN + close），
+  // 进程被 kill -9 时内核也会自动释放，不会留下死锁。
 }
 
 Status DB::Open(const Options& options, const std::string& name, DB** dbptr) {
@@ -130,6 +136,24 @@ Status DB::Open(const Options& options, const std::string& name, DB** dbptr) {
 Status DBImpl::Recover() {
   Status s = env_->CreateDirIfMissing(dbname_);
   if (!s.ok()) return s;
+
+  // 0) 先抢库级排他锁，再碰任何文件。
+  //
+  // 【顺序为什么重要】
+  // 必须放在 CreateDirIfMissing 之后（文件要存在才能 flock），但必须放在
+  // VersionSet 恢复**之前**。若反过来先恢复再抢锁，两个进程可能都完成了
+  // MANIFEST 重放、进入可写状态，然后第二个进程才抢锁失败——此时它已经把
+  // VersionSet 建起来了，必须完整回滚才能不留痕迹。先抢锁则失败得干净。
+  //
+  // 抢到锁之后 Recover 中途失败也没关系：DBImpl 被 delete，unique_ptr 析构
+  // 自动解锁，不会把锁泄漏给后续的重试。
+  lock_name_ = Filename::LockFileName(dbname_);
+  s = env_->LockFile(lock_name_, &db_lock_);
+  if (!s.ok()) {
+    return Status::InvalidArgument(
+        lock_name_,
+        "database is locked by another process (cannot acquire LOCK)");
+  }
 
   // 1) 版本 + MANIFEST 恢复（同时返回存活的 SSTable 编号与当前 WAL 编号）
   std::set<uint64_t> live_files;
@@ -281,6 +305,11 @@ Status DBImpl::CompactMemTable() {
   }
   file.reset();
 
+  // 崩溃注入点：SSTable 已完整落盘，但 MANIFEST 里还没有它。
+  // 此刻这个 .ldb 是孤儿——恢复时必须被清理，且数据仍能从旧 WAL 重放出来。
+  // 若恢复逻辑误把它当成有效文件，就会读到一份"存在但从未被承认"的数据。
+  MaybeCrashForTesting(kCrashPointAfterFlushSstWrite);
+
   const uint64_t file_size = builder.FileSize();
   const std::string smallest = builder.SmallestKey();
   const std::string largest = builder.LargestKey();
@@ -314,6 +343,11 @@ Status DBImpl::CompactMemTable() {
     env_->DeleteFile(fname);
     return s;
   }
+
+  // 崩溃注入点：MANIFEST 已提交，但旧 WAL 还在、新 WAL 还没建。
+  // 数据此时"两头都有"（SSTable 已登记、旧 WAL 未删），恢复必须容忍这种重叠：
+  // 重放旧 WAL 会得到重复记录，靠 sequence 去重即可，不能报错也不能丢。
+  MaybeCrashForTesting(kCrashPointAfterFlushCommit);
 
   // 4) 滚动 WAL：旧 WAL 的数据已经在 SSTable 里，可安全删除
   const std::string old_wal = wal_name_;
@@ -608,6 +642,11 @@ Status DBImpl::CompactLevel(int level) {
     }
   }
 
+  // 崩溃注入点：输出文件已全部落盘，但 MANIFEST 里既没登记它们、
+  // 也没声明删除源文件。恢复后源文件必须仍然有效——若恢复逻辑看到输出文件
+  // 就以为"压缩已完成"，会把真正持有数据的源文件当成孤儿删掉，直接丢数据。
+  MaybeCrashForTesting(kCrashPointAfterCompactionOutput);
+
   // 4) 原子提交：MANIFEST 里同时记录"新增输出文件"和"删除源文件"。
   //    这条记录落盘之前崩溃，旧文件仍在、新文件只是孤儿，重启后会被清理；
   //    落盘之后崩溃，两边都已登记，数据完整。绝不能分两次提交。
@@ -799,6 +838,10 @@ Status DBImpl::Write(const WriteBatch& my_batch) {
 
   Status s = log_->AddRecord(combined.Contents());
   if (s.ok()) s = logfile_->Sync();  // Group Commit 关键：一次 fsync 摊薄整组
+
+  // 崩溃注入点：WAL 已落盘、内存视图尚未更新。
+  // 这是"已对用户承诺成功但内存里看不到"的窗口，恢复必须靠 WAL 重放兜住。
+  MaybeCrashForTesting(kCrashPointAfterWalSync);
 
   if (s.ok()) {
     MemTable* m = mem_.load(std::memory_order_acquire);
