@@ -7,6 +7,7 @@
 #include <string>
 
 #include "tinystore/db.h"
+#include "tinystore/db_iterator.h"
 #include "tinystore/internal_key.h"
 #include "tinystore/log_reader.h"
 #include "tinystore/log_writer.h"
@@ -55,6 +56,10 @@ public:
   Status Get(const Slice& key, std::string* value) override;
   Status Write(const WriteBatch& batch) override;
 
+  // 组装 DBIterator：MemTable + 全部 SSTable 作为归并的数据源。
+  std::unique_ptr<Iterator> NewIterator(
+      const ReadOptions& options) const override;
+
   // 从 MANIFEST 恢复 Version + 当前 WAL 编号，重放 WAL，建立可写 WAL。
   Status Recover();
 
@@ -76,7 +81,9 @@ private:
   // --- 内存状态 ---
   // 保护 mem_ 的"读取 + 取引用"与"换表 + 释放旧表"这两个动作，
   // 使读者不可能拿到一个正在被 flush 释放的 MemTable。
-  std::mutex mem_mutex_;
+  // mutable：NewIterator 是 const 方法（它不修改 DB 状态），但仍需在锁内
+  // 取 MemTable 的引用。
+  mutable std::mutex mem_mutex_;
   std::atomic<MemTable*> mem_{nullptr};  // 活跃 MemTable；flush 时换出
   std::atomic<SequenceNumber> last_sequence_{0};
 

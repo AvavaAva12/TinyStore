@@ -210,6 +210,12 @@ public:
     // user_comparator_（会把 8 字节后缀一起压缩，产生长度 < 8 的非法 InternalKey，
     // 读路径解码后缀时 size - 8 下溢、Slice 越界 → 段错误）。压缩后再用最大
     // (seq, type) 拼回合法 InternalKey，使其排在原 user_key 所有版本之后、小于下一 user_key。
+    //
+    // 【为什么必须用具名局部变量】
+    // InternalKey::Encode() 返回的 Slice 指向对象内部的 rep_ 缓冲区。若写成
+    // `InternalKey(tmp, ...).Encode().ToString()`，临时对象在完整表达式结束前
+    // 就已析构，ToString() 读到的是悬垂内存——这是真实的 use-after-free，
+    // 症状是偶发的数据错乱或段错误，极难排查。
     void FindShortestSeparator(std::string* start, const Slice& limit) const override {
         Slice user_start = ExtractUserKey(*start);
         Slice user_limit = ExtractUserKey(limit);
@@ -217,7 +223,8 @@ public:
         user_comparator_->FindShortestSeparator(&tmp, user_limit);
         if (tmp.size() < user_start.size() &&
             user_comparator_->Compare(user_start, Slice(tmp)) < 0) {
-            *start = InternalKey(tmp, kMaxSequenceNumber, kTypeValue).Encode().ToString();
+            const InternalKey shortened(tmp, kMaxSequenceNumber, kTypeValue);
+            *start = shortened.Encode().ToString();
         }
     }
     void FindShortSuccessor(std::string* key) const override {
@@ -226,7 +233,8 @@ public:
         user_comparator_->FindShortSuccessor(&tmp);
         if (tmp.size() < user_key.size() &&
             user_comparator_->Compare(user_key, Slice(tmp)) < 0) {
-            *key = InternalKey(tmp, kMaxSequenceNumber, kTypeValue).Encode().ToString();
+            const InternalKey successor(tmp, kMaxSequenceNumber, kTypeValue);
+            *key = successor.Encode().ToString();
         }
     }
 

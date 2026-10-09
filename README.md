@@ -97,6 +97,7 @@ TinyStore/
 | **W3** | DB 写路径 + Group Commit + 无锁快照读 | ✅ 完成 |
 | **W4** | 读路径 + 持久化：`Block` / `SSTable` / `BloomFilter` / `Flush` / `Version` / `VersionSet` / `MANIFEST` / 崩溃恢复 | ✅ 完成 |
 | **fix(W4)** | 代码审查缺陷修复：静默丢数据、RCU use-after-free、整数溢出绕过等 | ✅ 完成 |
+| **W5** | 迭代器：`DB::NewIterator` + SSTable 遍历 + 跨源归并 + MVCC 过滤 + 快照读 | ✅ 完成 |
 
 > 说明：原规划把「读路径 / BloomFilter」列为 W5、「Flush / Version / MANIFEST」列为 W6。
 > 实际执行时这两块内容合并进了 W4 一次提交（原 W5、W6 的条目已不再单列）。
@@ -106,10 +107,10 @@ TinyStore/
 
 | 优先级 | 主题 | 动机 / 现状缺口 |
 |---|---|---|
-| **P0** | **Compaction**（Leveled 策略 + 后台线程 + 墓碑 GC） | SSTable 目前**只增不减**：W4 只有 flush，没有 compaction，文件数与读放大随写入量线性增长。这是 LSM 最核心的缺失环节。需处理键范围重叠、删除墓碑回收、多文件合并时旧 Version 不被并发读销毁 |
-| **P0** | **迭代器**（`DB::NewIterator`） | 当前只能点查 `Get`，无法范围扫描。需统一 MemTable 迭代器与 SSTable 多文件合并迭代，实现 `SeekToFirst/SeekToLast/Seek/Next/Prev`，并正确按 snapshot 过滤版本 |
+| **P0** | **Compaction**（Leveled 策略 + 后台线程 + 墓碑 GC） | SSTable 目前**只增不减**：只有 flush，没有 compaction，文件数与读放大随写入量线性增长。这是 LSM 最核心的缺失环节。需处理键范围重叠、删除墓碑回收、多文件合并时旧 Version 不被并发读销毁 |
+| **P1** | **迭代器反向遍历**（`Prev` / `SeekToLast`） | W5 已完成正向遍历（`SeekToFirst/Seek/Next`）。反向需 SSTable 能反向定位并倒序扫描块，而前缀压缩让倒序扫描需维护解压栈，属独立工作量 |
 | **P1** | **TableCache 淘汰** | `table_cache_` 只增不减、不淘汰，全库 SSTable 常驻内存。需 LRU + 容量上限 + 引用计数安全驱逐（与 RCU 引用模型协同） |
-| **P1** | **真正的 Snapshot API** | `Get` 只能读「当前最新」。W4 的 MVCC 是「点查传入 sequence」的底层能力，尚未暴露 `GetSnapshot()` / `ReleaseSnapshot()` 句柄以支持历史读与跨多次读的一致性视图 |
+| **P1** | **Snapshot 句柄 API** | `ReadOptions.snapshot` 已能按序号做历史读（W5），但缺 `GetSnapshot()` / `ReleaseSnapshot()` 这样的生命周期句柄，无法表达"先取快照、再做别的、最后按快照读"这一自然用法 |
 | **P2** | **可靠性工程**：`TestEnv` 故障注入 + 崩溃一致性测试 | `env.h` 已预留 `EnvWrapper` 与 `Schedule`/`StartThread`，但尚未落地。需注入「第 N 次写失败 / 截断文件 / 损坏 CRC」等故障，验证恢复路径；以及真正的 `kill -9` 崩溃测试 |
 | **P2** | **文件锁**（`Env::LockFile`） | 接口已定义但未使用。缺少它，多进程同时打开同一目录会各自维护 MemTable 与 VersionSet 并并发写同一个 MANIFEST，直接损坏数据 |
 | **P2** | **MANIFEST 快照与压缩** | MANIFEST 目前只追加、从不压缩，长时间运行会无限增长。重放时间随之线性上升 |

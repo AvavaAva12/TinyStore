@@ -397,4 +397,135 @@ uint64_t Table::ApproximateOffsetOf(const Slice& key) const {
   return result;
 }
 
+// ===========================================================================
+// TableIterator —— 单个 SSTable 的顺序遍历
+// ===========================================================================
+namespace detail {
+
+// 【遍历结构：索引块常驻，数据块按需预读】
+// index block 只有几百字节，整个常驻内存，遍历时从头到尾走一遍它，
+// 每条 entry 给出一个 data block 的句柄。每跨一个 entry 就 pread 那一个
+// data block 到 data_contents_，用完直接被下一个覆盖——所以内存占用
+// 与文件大小无关，恒定为"一个块 + 一个索引块"。
+//
+// 【为什么 index_iter_.Seek(target) 能定位到正确的块】
+// 索引 entry 的 key 是"该块上界与下一块下界之间的最短分隔键"，
+// 它严格大于本块所有实际 key。于是"第一个索引 key >= target 的 entry"
+// 恰好就是包含 target 的那个块：
+//   target 落在块内        -> 分隔键 >= target，命中本块
+//   target 是本块最后一个  -> 分隔键 > target，仍命中本块
+//   target 超过全部数据    -> 没有 entry >= target，Valid() 为假，遍历正确结束
+class TableIterator : public Iterator {
+public:
+  explicit TableIterator(const Table* table)
+      : table_(table), index_iter_(table->index_block_.get(), table->icmp_) {}
+
+  bool Valid() const override { return valid_ && data_iter_ && data_iter_->Valid(); }
+
+  void SeekToFirst() override {
+    if (!status_.ok()) return;
+    index_iter_.SeekToFirst();
+    if (!index_iter_.Valid()) {  // 空表：index block 里没有任何 entry
+      valid_ = false;
+      return;
+    }
+    LoadCurrentBlock();                       // 进入第一个 data block
+    if (!data_iter_) return;
+    data_iter_->SeekToFirst();                // 块内从头开始
+    valid_ = data_iter_->Valid();
+  }
+
+  // 按 user_key 定位到它的最新版本。
+  //
+  // 对外约定 target 是裸 user_key（与 Get 一致），但块内查找用的是完整
+  // internal_key，所以这里构造一个查找键：user_key 配上 (kMaxSequenceNumber,
+  // kTypeValue)。比较器对同 user_key 按 seq 降序排，这个后缀排在所有真实版本
+  // 之前，于是 Seek 恰好停在"该 user_key 的第一个（最新）版本"上。
+  void Seek(const Slice& target) override {
+    if (!status_.ok()) return;
+    const InternalKey lookup(target, kMaxSequenceNumber, kTypeValue);
+    const Slice lookup_ikey = lookup.Encode();
+    // 先在索引里定位到候选块，再在块内二分。
+    index_iter_.Seek(lookup_ikey);
+    if (!index_iter_.Valid()) {  // target 大于文件里所有 key
+      valid_ = false;
+      return;
+    }
+    LoadCurrentBlock();
+    if (!data_iter_) return;
+    data_iter_->Seek(lookup_ikey);             // 块内找第一个 >= 查找键的 entry
+    valid_ = data_iter_->Valid();
+  }
+
+  void Next() override {
+    if (!Valid()) return;
+    data_iter_->Next();
+    while (data_iter_ && !data_iter_->Valid()) {
+      // 当前块扫完，进入下一个块（index entry）。
+      if (!NextIndexEntry()) return;
+      LoadCurrentBlock();
+      if (!data_iter_) return;
+      data_iter_->SeekToFirst();              // 新块从头开始
+    }
+    valid_ = data_iter_ && data_iter_->Valid();
+  }
+
+  Slice key() const override {
+    assert(Valid());
+    return data_iter_->key();
+  }
+  Slice value() const override {
+    assert(Valid());
+    return data_iter_->value();
+  }
+  Status status() const override { return status_; }
+
+private:
+  // 把 index_iter_ 当前 entry 的句柄读出来，加载成当前 data block。
+  void LoadCurrentBlock() {
+    BlockHandle h;
+    Slice hv = index_iter_.value();
+    Status s = h.DecodeFrom(&hv);
+    if (!s.ok()) {
+      status_ = s;
+      valid_ = false;
+      return;
+    }
+    s = table_->ReadBlock(h, &data_contents_);
+    if (!s.ok()) {
+      status_ = s;
+      valid_ = false;
+      return;
+    }
+    // Block 存进 unique_ptr 而非栈上对象：Block::Iter 内部持有指向 Block 的
+    // 裸指针，必须保证 Block 的地址在 data_iter_ 存活期间稳定不变。
+    data_block_ = std::make_unique<Block>(Slice(data_contents_));
+    data_iter_ = std::make_unique<Block::Iter>(data_block_.get(), table_->icmp_);
+  }
+
+  // index_iter_ 前进到下一个 entry；返回是否还有下一个块。
+  bool NextIndexEntry() {
+    index_iter_.Next();
+    if (!index_iter_.Valid()) {
+      valid_ = false;  // 正常遍历到文件末尾
+      return false;
+    }
+    return true;
+  }
+
+  const Table* table_;
+  Block::Iter index_iter_;
+  std::string data_contents_;                 // 当前 data block 的内容
+  std::unique_ptr<Block> data_block_;
+  std::unique_ptr<Block::Iter> data_iter_;
+  bool valid_ = false;
+  Status status_;
+};
+
+}  // namespace detail
+
+std::unique_ptr<Iterator> Table::NewIterator() const {
+  return std::make_unique<detail::TableIterator>(this);
+}
+
 }  // namespace tinystore

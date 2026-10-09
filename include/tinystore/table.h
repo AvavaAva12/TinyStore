@@ -9,10 +9,16 @@
 #include "tinystore/env.h"
 #include "tinystore/filter_policy.h"
 #include "tinystore/internal_key.h"
+#include "tinystore/iterator.h"
 #include "tinystore/slice.h"
 #include "tinystore/status.h"
 
 namespace tinystore {
+
+namespace detail {
+// Table 的迭代器实现只服务于 table.cpp，这里前置声明仅为满足友元声明。
+class TableIterator;
+}  // namespace detail
 
 // ===========================================================================
 // SSTable（Sorted String Table）—— 不可变的有序文件，LSM 树的持久化层
@@ -127,9 +133,22 @@ public:
   Status Get(const Slice& user_key, SequenceNumber snapshot,
              const FilterPolicy* filter_policy, std::string* value, bool* found) const;
 
+  // 按 internal_key 升序遍历整个文件的全部 entry。
+  //
+  // 【它不做 MVCC 过滤】
+  // 返回的是文件的**原始内容**：同一个 user_key 的多个历史版本都会依次出现，
+  // 删除墓碑也会出现。snapshot 过滤与墓碑跳过是上层的职责（见 db_iterator），
+  // 这样 SSTable 层可以保持"所见即文件所存"的简单语义，也便于独立测试。
+  //
+  // 【调用方约定】迭代期间 Table 必须存活（迭代器持有裸指针）。
+  // data block 按需 pread，只有当前所在的那一个 block 占用内存。
+  std::unique_ptr<Iterator> NewIterator() const;
+
   uint64_t ApproximateOffsetOf(const Slice& key) const;  // 供 Compaction 估算（W5）
 
 private:
+  friend class detail::TableIterator;
+
   Table(const InternalKeyComparator* icmp, std::unique_ptr<RandomAccessFile> file,
         uint64_t file_size);
 

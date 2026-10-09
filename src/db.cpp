@@ -415,4 +415,42 @@ Status DBImpl::Get(const Slice& key, std::string* value) {
   return Status::NotFound("not found");
 }
 
+// ---------------------------------------------------------------------------
+// NewIterator：跨 MemTable 与全部 SSTable 的归并迭代器
+// ---------------------------------------------------------------------------
+std::unique_ptr<Iterator> DBImpl::NewIterator(const ReadOptions& options) const {
+  const SequenceNumber snapshot = options.snapshot;
+
+  // Version：与 Get 同样在锁内取引用。迭代期间 flush 可以换版本，但本迭代器
+  // 只依赖这一份 Version 的文件列表（Table 本身由 VersionSet 的缓存持有），
+  // 因此中途出现的新 SSTable 不会被看到——这与"快照读"语义一致。
+  Version* v = versions_->current();
+  if (v == nullptr) return std::make_unique<DBIterator>(&icmp_, snapshot);
+
+  auto it = std::make_unique<DBIterator>(&icmp_, snapshot);
+
+  // MemTable 作为第一个数据源。适配器在构造时 Ref、析构时 Unref，所以即使
+  // 迭代途中发生 flush 把这个 MemTable 换出去，它也一定存活到迭代器销毁。
+  MemTable* m = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(mem_mutex_);
+    m = mem_.load(std::memory_order_relaxed);
+  }
+  if (m != nullptr) {
+    it->AddChild(std::make_unique<MemTableIteratorAdapter>(m));
+  }
+
+  // SSTable：从新到旧全部加入。L0 文件之间 key 范围可能重叠，交由归并处理，
+  // 因此这里不需要（也不能）按范围裁剪——遍历就该看到全量数据。
+  for (int i = static_cast<int>(v->files().size()) - 1; i >= 0; --i) {
+    Table* t = versions_->GetTable(v->files()[i].number);
+    if (t == nullptr) continue;  // 打不开的文件跳过，与 Get 的处理一致
+    it->AddChild(t->NewIterator());
+  }
+  v->Unref();
+
+  it->SeekToFirst();
+  return it;
+}
+
 }  // namespace tinystore

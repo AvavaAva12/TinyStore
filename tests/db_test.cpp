@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -354,6 +355,242 @@ TEST(DBTest, ConcurrentWritesWithFlushes) {
       ASSERT_EQ(got, "v" + std::to_string(i));
     }
   }
+
+  delete db;
+  RemoveAll(name);
+}
+
+// ---- W5：迭代器（范围扫描）端到端 ----
+
+// 把迭代器输出收集成 vector<(key, value)>
+static std::vector<std::pair<std::string, std::string>> ScanAll(
+    DB* db, const ReadOptions& options = ReadOptions()) {
+  std::vector<std::pair<std::string, std::string>> out;
+  std::unique_ptr<Iterator> it(db->NewIterator(options));
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    out.emplace_back(it->key().ToString(), it->value().ToString());
+  }
+  EXPECT_TRUE(it->status().ok()) << it->status().ToString();
+  return out;
+}
+
+TEST(DBTest, IteratorScansWholeDatabase) {
+  Options opt;
+  opt.create_if_missing = true;
+  const std::string name = TempDbName("iterscan");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+  ASSERT_TRUE(db->Put("apple", "1").ok());
+  ASSERT_TRUE(db->Put("banana", "2").ok());
+  ASSERT_TRUE(db->Put("cherry", "3").ok());
+
+  auto got = ScanAll(db);
+  std::vector<std::pair<std::string, std::string>> want = {
+      {"apple", "1"}, {"banana", "2"}, {"cherry", "3"}};
+  EXPECT_EQ(got, want);
+
+  delete db;
+  RemoveAll(name);
+}
+
+// 遍历必须能跨 MemTable 与 SSTable 两个来源：极小的 write_buffer_size 让每次
+// Put 都 flush，数据落在 SSTable；两者需被正确归并且不重不漏。
+TEST(DBTest, IteratorSpansMemTableAndSSTables) {
+  Options opt;
+  opt.create_if_missing = true;
+  opt.write_buffer_size = 1024;  // 触发 flush
+  const std::string name = TempDbName("iterspan");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  const int n = 300;
+  for (int i = 0; i < n; ++i) {
+    ASSERT_TRUE(db->Put("key" + std::to_string(i),
+                        "v" + std::to_string(i)).ok())
+        << i;
+  }
+
+  auto got = ScanAll(db);
+  ASSERT_EQ(got.size(), static_cast<size_t>(n));
+
+  // 迭代器按 user_key 的**字典序**输出，不是数值序——"key10" < "key2"
+  // （'1' < '2'）。因此不能拿第 i 个元素去对第 i 个 key，而要校验三件事：
+  //   1. 输出严格字典序递增（有序）
+  //   2. key 集合完整、无遗漏无重复
+  //   3. 每个 key 的值与 Get 一致（迭代视图 == 点查视图）
+  for (size_t i = 1; i < got.size(); ++i) {
+    EXPECT_LT(BytewiseComparator()->Compare(got[i - 1].first, got[i].first), 0)
+        << "iteration must be strictly ascending at index " << i;
+  }
+
+  std::vector<std::string> want_keys;
+  for (int i = 0; i < n; ++i) {
+    const std::string k = "key" + std::to_string(i);
+    want_keys.push_back(k);
+    std::string v;
+    ASSERT_TRUE(db->Get(k, &v).ok()) << k;
+    EXPECT_EQ("v" + std::to_string(i), v) << k;
+  }
+  std::sort(want_keys.begin(), want_keys.end(),
+            [](const std::string& a, const std::string& b) {
+              return BytewiseComparator()->Compare(a, b) < 0;
+            });
+
+  std::vector<std::string> got_keys;
+  got_keys.reserve(got.size());
+  for (const auto& kv : got) got_keys.push_back(kv.first);
+  EXPECT_EQ(got_keys, want_keys);
+
+  delete db;
+  RemoveAll(name);
+}
+
+// 迭代器视图必须与 Get 一致；删除的 key 在迭代中不出现。
+TEST(DBTest, IteratorSkipsDeletedAndMatchesGet) {
+  Options opt;
+  opt.create_if_missing = true;
+  opt.write_buffer_size = 1024;
+  const std::string name = TempDbName("iterdel");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_TRUE(db->Put("k" + std::to_string(i), "v").ok());
+  }
+  ASSERT_TRUE(db->Delete("k0").ok());
+  ASSERT_TRUE(db->Delete("k50").ok());
+  ASSERT_TRUE(db->Delete("k99").ok());
+
+  auto got = ScanAll(db);
+  EXPECT_EQ(got.size(), 97u);
+  for (const auto& kv : got) {
+    const std::string& k = kv.first;
+    EXPECT_NE("k0", k);
+    EXPECT_NE("k50", k);
+    EXPECT_NE("k99", k);
+    std::string v;
+    ASSERT_TRUE(db->Get(k, &v).ok()) << k;
+    EXPECT_EQ(kv.second, v) << k;
+  }
+
+  delete db;
+  RemoveAll(name);
+}
+
+// 同一 key 多次写入：迭代只应出现一次，且是最新值。
+TEST(DBTest, IteratorYieldsLatestVersionOnlyOnce) {
+  Options opt;
+  opt.create_if_missing = true;
+  opt.write_buffer_size = 1024;
+  const std::string name = TempDbName("iterdup");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  for (int i = 0; i < 20; ++i) {
+    ASSERT_TRUE(db->Put("hot", "v" + std::to_string(i)).ok());
+  }
+  ASSERT_TRUE(db->Put("other", "x").ok());
+
+  auto got = ScanAll(db);
+  ASSERT_EQ(got.size(), 2u);
+  EXPECT_EQ("hot", got[0].first);
+  EXPECT_EQ("v19", got[0].second) << "应取最新版本";
+  EXPECT_EQ("other", got[1].first);
+
+  delete db;
+  RemoveAll(name);
+}
+
+// Seek + Next：从中间开始扫到末尾。
+TEST(DBTest, IteratorSeekAndNext) {
+  Options opt;
+  opt.create_if_missing = true;
+  const std::string name = TempDbName("itersk");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+  ASSERT_TRUE(db->Put("a", "1").ok());
+  ASSERT_TRUE(db->Put("c", "3").ok());
+  ASSERT_TRUE(db->Put("e", "5").ok());
+
+  std::unique_ptr<Iterator> it(db->NewIterator(ReadOptions()));
+  it->Seek("c");
+  std::vector<std::string> seen;
+  for (; it->Valid(); it->Next()) seen.push_back(it->key().ToString());
+  std::vector<std::string> want = {"c", "e"};
+  EXPECT_EQ(seen, want);
+
+  // Seek 越过末尾 -> 无效，但不崩
+  it->Seek("zzz");
+  EXPECT_FALSE(it->Valid());
+  EXPECT_TRUE(it->status().ok());
+
+  delete db;
+  RemoveAll(name);
+}
+
+// 空库：迭代器立即无效，不崩。
+TEST(DBTest, IteratorOnEmptyDatabase) {
+  Options opt;
+  opt.create_if_missing = true;
+  const std::string name = TempDbName("iterempty");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  std::unique_ptr<Iterator> it(db->NewIterator(ReadOptions()));
+  it->SeekToFirst();
+  EXPECT_FALSE(it->Valid());
+  EXPECT_TRUE(it->status().ok());
+  it->Seek("anything");
+  EXPECT_FALSE(it->Valid());
+  EXPECT_TRUE(ScanAll(db).empty());
+
+  delete db;
+  RemoveAll(name);
+}
+
+// 快照读：旧快照视图不应包含快照之后写入的数据。
+// 这是迭代器"时间旅行"能力的端到端验证——ReadOptions.snapshot 固定后，
+// 后续写入对该视图不可见，且遍历结果保持一致。
+TEST(DBTest, IteratorHonorsSnapshot) {
+  Options opt;
+  opt.create_if_missing = true;
+  const std::string name = TempDbName("itersnap");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+  ASSERT_TRUE(db->Put("a", "old").ok());  // 第一条写入占用 sequence 1
+
+  ReadOptions snap;
+  snap.snapshot = 1;  // 固定"只含 sequence <= 1"的视图
+  ASSERT_TRUE(db->Put("b", "new").ok());
+
+  std::unique_ptr<Iterator> old_it(db->NewIterator(snap));
+  old_it->SeekToFirst();
+  ASSERT_TRUE(old_it->Valid());
+  EXPECT_EQ("a", old_it->key().ToString());
+  EXPECT_EQ("old", old_it->value().ToString());
+  old_it->Next();
+  EXPECT_FALSE(old_it->Valid())
+      << "快照之后写入的 b 不应出现在旧快照视图中";
+
+  // 默认读最新：a、b 都在
+  auto now = ScanAll(db);
+  ASSERT_EQ(now.size(), 2u);
+  EXPECT_EQ("b", now[1].first);
+  EXPECT_EQ("new", now[1].second);
 
   delete db;
   RemoveAll(name);
