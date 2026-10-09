@@ -93,15 +93,28 @@ TinyStore/
 | 周 | 主题 | 状态 |
 |---|---|---|
 | **W1** | 工程地基 + `Slice` / `Status` / `Coding` / `Comparator` / `Arena` / `InternalKey` / `Env` | ✅ 完成 |
-| W2 | `SkipList` + `MemTable` | ⬜ |
-| W3 | WAL + Group Commit + 故障注入 | ⬜ |
-| W4 | Block / SSTable 格式 | ⬜ |
-| W5 | 读路径：TableCache + 迭代器 + BloomFilter | ⬜ |
-| W6 | Flush + Version / VersionSet / MANIFEST | ⬜ |
-| W7 | Compaction（Leveled 策略 + 后台线程） | ⬜ |
-| W8 | 并发攻坚：锁粒度演进 + 无锁队列 + TSAN | ⬜ |
-| W9 | MVCC 快照读 + WriteBatch 事务 | ⬜ |
-| W10 | epoll Reactor + RESP 协议 | ⬜ |
+| **W2** | `SkipList` + `MemTable` + `WriteBatch` + `WAL` + `CRC32C` | ✅ 完成 |
+| **W3** | DB 写路径 + Group Commit + 无锁快照读 | ✅ 完成 |
+| **W4** | 读路径 + 持久化：`Block` / `SSTable` / `BloomFilter` / `Flush` / `Version` / `VersionSet` / `MANIFEST` / 崩溃恢复 | ✅ 完成 |
+| **fix(W4)** | 代码审查缺陷修复：静默丢数据、RCU use-after-free、整数溢出绕过等 | ✅ 完成 |
+
+> 说明：原规划把「读路径 / BloomFilter」列为 W5、「Flush / Version / MANIFEST」列为 W6。
+> 实际执行时这两块内容合并进了 W4 一次提交（原 W5、W6 的条目已不再单列）。
+> W2 也并入了原 W3 的 WAL 部分。下表是**尚未完成**的工作，按依赖与优先级重排。
+
+### 后续计划
+
+| 优先级 | 主题 | 动机 / 现状缺口 |
+|---|---|---|
+| **P0** | **Compaction**（Leveled 策略 + 后台线程 + 墓碑 GC） | SSTable 目前**只增不减**：W4 只有 flush，没有 compaction，文件数与读放大随写入量线性增长。这是 LSM 最核心的缺失环节。需处理键范围重叠、删除墓碑回收、多文件合并时旧 Version 不被并发读销毁 |
+| **P0** | **迭代器**（`DB::NewIterator`） | 当前只能点查 `Get`，无法范围扫描。需统一 MemTable 迭代器与 SSTable 多文件合并迭代，实现 `SeekToFirst/SeekToLast/Seek/Next/Prev`，并正确按 snapshot 过滤版本 |
+| **P1** | **TableCache 淘汰** | `table_cache_` 只增不减、不淘汰，全库 SSTable 常驻内存。需 LRU + 容量上限 + 引用计数安全驱逐（与 RCU 引用模型协同） |
+| **P1** | **真正的 Snapshot API** | `Get` 只能读「当前最新」。W4 的 MVCC 是「点查传入 sequence」的底层能力，尚未暴露 `GetSnapshot()` / `ReleaseSnapshot()` 句柄以支持历史读与跨多次读的一致性视图 |
+| **P2** | **可靠性工程**：`TestEnv` 故障注入 + 崩溃一致性测试 | `env.h` 已预留 `EnvWrapper` 与 `Schedule`/`StartThread`，但尚未落地。需注入「第 N 次写失败 / 截断文件 / 损坏 CRC」等故障，验证恢复路径；以及真正的 `kill -9` 崩溃测试 |
+| **P2** | **文件锁**（`Env::LockFile`） | 接口已定义但未使用。缺少它，多进程同时打开同一目录会各自维护 MemTable 与 VersionSet 并并发写同一个 MANIFEST，直接损坏数据 |
+| **P2** | **MANIFEST 快照与压缩** | MANIFEST 目前只追加、从不压缩，长时间运行会无限增长。重放时间随之线性上升 |
+| **P3** | **性能与可观测**：Block 缓存、统计信息、`Logger` 落地 | `ApproximateOffsetOf` 当前是简化版；`Logger` 接口存在但未接入；缺读写延迟 / flush 次数 / 每次 flush 字节数等指标 |
+| **P4** | 可选扩展：`epoll` Reactor + RESP 协议、Raft 复制 | 网络层与分布式复制，属于加分项，不影响存储引擎主线 |
 
 ---
 
