@@ -57,6 +57,27 @@ struct Options {
   // 想要自定义参数时，用 NewBloomFilterPolicy 自建并自行 delete。
   // 设置 nullptr 可关闭，以便对比"无过滤"时的读放大。
   const FilterPolicy* filter_policy = DefaultFilterPolicy();
+
+  // --- Compaction（LSM 的核心收益来源）---
+
+  // L0 的文件数达到此值就触发 L0 -> L1。
+  // L0 文件全部来自 flush，彼此可能键范围重叠，所以点查最坏要扫遍 L0 全部文件；
+  // 限制它的数量就是给读放大设一个上界。
+  size_t l0_compaction_trigger = 4;
+
+  // level >= 1 各层的容量上限基准值。level i 的实际上限是
+  //   max_level_bytes * max_level_bytes_multiplier^(i-1)
+  // 逐层递增是 Leveled Compaction 的核心思想：让绝大多数数据沉在底层，
+  // 顶层只保留少量"刚写入、可能马上被合并掉"的数据。
+  uint64_t max_level_bytes = 8u << 20;  // 8MB
+  uint64_t max_level_bytes_multiplier = 10;
+
+  // 最多允许有多少层（含 L0）。层数受 level 编号位数限制，超出会写爆内部键。
+  int max_num_levels = 7;
+
+  // 单个 compaction 输出文件的目标大小。归并结果超过它就切成多个文件——
+  // 否则一次大归并可能产出一个巨大文件，下次读它的代价过高。
+  uint64_t max_compaction_file_size = 2u << 20;  // 2MB
 };
 
 // ===========================================================================
@@ -111,6 +132,21 @@ public:
   // 【生命周期】返回的迭代器必须在 DB 关闭前销毁（或先 delete DB 再销毁迭代器）。
   virtual std::unique_ptr<Iterator> NewIterator(
       const ReadOptions& options) const = 0;
+
+  // ---- 统计与自省（W6：让 Compaction 的行为可被断言）----
+  //
+  // Compaction 是否真的生效，没法只靠"读出来的数据对不对"来判断——数据全对
+  // 但文件数爆炸，同样是坏设计（读放大会随写入量线性上升，点查迟早超时）。
+  // 下面这几个计数让测试能直接断言"压缩确实发生、文件数确实收敛"。
+
+  // 各层的 SSTable 文件数，索引 0 即 L0；长度至少为 1。
+  virtual std::vector<size_t> GetLevelFileCounts() const = 0;
+
+  // 各层的总字节数，索引 0 即 L0。
+  virtual std::vector<size_t> GetLevelBytes() const = 0;
+
+  // SSTable 文件总数。
+  virtual size_t NumTableFiles() const = 0;
 };
 
 }  // namespace tinystore

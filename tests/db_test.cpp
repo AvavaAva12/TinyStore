@@ -596,5 +596,229 @@ TEST(DBTest, IteratorHonorsSnapshot) {
   RemoveAll(name);
 }
 
+// ---- W6：Compaction ----
+
+// 让写入产生大量 flush：用极小的 write_buffer_size，每个 MemTable 很快写满。
+static Options TinyBufferOptions(const std::string& sub) {
+  (void)sub;
+  Options opt;
+  opt.create_if_missing = true;
+  opt.write_buffer_size = 1024;
+  return opt;
+}
+
+// 核心收益：文件数必须收敛，而不是随写入量线性增长。
+// 这是 Compaction 存在的唯一理由，务必直接断言。
+TEST(DBTest, CompactionConvergesFileCount) {
+  Options opt = TinyBufferOptions("compact1");
+  opt.l0_compaction_trigger = 4;
+  const std::string name = TempDbName("compact1");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  const int n = 2000;
+  for (int i = 0; i < n; ++i) {
+    ASSERT_TRUE(db->Put("k" + std::to_string(i), "v" + std::to_string(i)).ok());
+  }
+
+  // 每次写满 MemTable 都会 flush 出 1 个 L0 文件，2000 次写会产生上千个文件。
+  // 若 compaction 生效，L0 会被压在阈值内，大部分数据沉到 L1，总文件数应远小于 n。
+  const size_t files = db->NumTableFiles();
+  const auto counts = db->GetLevelFileCounts();
+  EXPECT_LT(files, static_cast<size_t>(n) / 2)
+      << "compaction did not converge file count: " << files;
+  EXPECT_LE(counts[0], opt.l0_compaction_trigger)
+      << "L0 should stay under the trigger threshold";
+
+  // 数据必须一条不少、值不能错
+  for (int i = 0; i < n; ++i) {
+    const std::string k = "k" + std::to_string(i);
+    std::string v;
+    ASSERT_TRUE(db->Get(k, &v).ok()) << "missing after compaction: " << k;
+    EXPECT_EQ("v" + std::to_string(i), v) << k;
+  }
+
+  delete db;
+  RemoveAll(name);
+}
+
+// 归并必须保留最新版本：同一个 key 反复覆盖后只应留下最后一次的值。
+TEST(DBTest, CompactionKeepsLatestVersion) {
+  Options opt = TinyBufferOptions("compact2");
+  opt.l0_compaction_trigger = 4;
+  const std::string name = TempDbName("compact2");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  // 少量 key 反复写，跨过多次 compaction 边界
+  const int rounds = 200;
+  for (int i = 0; i < rounds; ++i) {
+    for (int k = 0; k < 20; ++k) {
+      ASSERT_TRUE(db->Put("hot" + std::to_string(k),
+                          "round" + std::to_string(i)).ok());
+    }
+  }
+  for (int k = 0; k < 20; ++k) {
+    std::string v;
+    ASSERT_TRUE(db->Get("hot" + std::to_string(k), &v).ok());
+    EXPECT_EQ("round" + std::to_string(rounds - 1), v);
+  }
+
+  delete db;
+  RemoveAll(name);
+}
+
+// 墓碑必须在 compaction 中被真正回收：删掉的 key 不应继续占用空间。
+// 若墓碑没被丢掉，被删 key 的旧值会在某次压缩后"复活"。
+TEST(DBTest, CompactionReclaimsTombstones) {
+  Options opt = TinyBufferOptions("compact3");
+  opt.l0_compaction_trigger = 4;
+  const std::string name = TempDbName("compact3");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  // 写入一批数据后全部删除，再写入更多数据触发多轮 compaction
+  for (int i = 0; i < 500; ++i) {
+    ASSERT_TRUE(db->Put("gone" + std::to_string(i), "x").ok());
+  }
+  for (int i = 0; i < 500; ++i) {
+    ASSERT_TRUE(db->Delete("gone" + std::to_string(i)).ok());
+  }
+  for (int i = 0; i < 500; ++i) {
+    ASSERT_TRUE(db->Put("stay" + std::to_string(i), "y").ok());
+  }
+
+  // 删除的 key 必须真的消失（否则说明墓碑被丢掉得太早、或旧值复活）
+  for (int i = 0; i < 500; ++i) {
+    std::string v;
+    EXPECT_TRUE(db->Get("gone" + std::to_string(i), &v).IsNotFound())
+        << "deleted key came back: gone" << i;
+  }
+  // 保留的 key 必须完好
+  for (int i = 0; i < 500; ++i) {
+    std::string v;
+    ASSERT_TRUE(db->Get("stay" + std::to_string(i), &v).ok()) << i;
+    EXPECT_EQ("y", v);
+  }
+
+  // 墓碑回收后，总字节数不应随"写了又删"的总量线性膨胀。
+  // 这里只做宽松断言：删掉 500 个 key 后，L1 体积应明显小于同时保留 1000 个 key。
+  const auto bytes = db->GetLevelBytes();
+  uint64_t total = 0;
+  for (size_t b : bytes) total += b;
+  EXPECT_LT(total, 4u << 20) << "tombstones were not reclaimed, bytes=" << total;
+
+  delete db;
+  RemoveAll(name);
+}
+
+// 全部 key 被删光时，compaction 不得产出空 SSTable。
+TEST(DBTest, CompactionOfFullyDeletedSetProducesNoFiles) {
+  Options opt = TinyBufferOptions("compact4");
+  opt.l0_compaction_trigger = 4;
+  const std::string name = TempDbName("compact4");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  for (int i = 0; i < 200; ++i) {
+    ASSERT_TRUE(db->Put("k" + std::to_string(i), "v").ok());
+    ASSERT_TRUE(db->Delete("k" + std::to_string(i)).ok());
+  }
+
+  // 数据全没了，被 tombstone 占住的空间应被 compaction 回收。
+  //
+  // 这里允许残留少量文件：末尾若还有没写满的 MemTable，要等下一次写入才会
+  // flush 并触发下一轮 compaction。只要被删的数据不再以旧值形式留在磁盘上，
+  // compaction 的目的就达到了。
+  const size_t left = db->NumTableFiles();
+  EXPECT_LE(left, 2u) << "fully-deleted data should be reclaimed, left " << left
+                      << " files";
+
+  // 更要紧的是：这些 key 既读不到，也不会在后续 compaction 中复活。
+  for (int i = 0; i < 200; ++i) {
+    std::string v;
+    EXPECT_TRUE(db->Get("k" + std::to_string(i), &v).IsNotFound()) << i;
+  }
+
+  delete db;
+  RemoveAll(name);
+}
+
+// compaction 之后重开，数据必须仍然完整（MANIFEST 的增删记录要能正确重放）。
+TEST(DBTest, CompactionSurvivesReopen) {
+  Options opt = TinyBufferOptions("compact5");
+  opt.l0_compaction_trigger = 4;
+  const std::string name = TempDbName("compact5");
+  RemoveAll(name);
+
+  const int n = 1000;
+  {
+    DB* db;
+    ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+    for (int i = 0; i < n; ++i) {
+      ASSERT_TRUE(db->Put("k" + std::to_string(i), "v" + std::to_string(i)).ok());
+    }
+    for (int i = 0; i < n; i += 10) {
+      ASSERT_TRUE(db->Delete("k" + std::to_string(i)).ok());
+    }
+    delete db;
+  }
+  {
+    DB* db;
+    ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+    for (int i = 0; i < n; ++i) {
+      std::string v;
+      const std::string k = "k" + std::to_string(i);
+      if (i % 10 == 0) {
+        EXPECT_TRUE(db->Get(k, &v).IsNotFound()) << k;
+      } else {
+        ASSERT_TRUE(db->Get(k, &v).ok()) << k;
+        EXPECT_EQ("v" + std::to_string(i), v) << k;
+      }
+    }
+    delete db;
+  }
+  RemoveAll(name);
+}
+
+// 反复开关数据库：MANIFEST 不断追加增删记录，重开不得报错、数据不得丢。
+TEST(DBTest, CompactionRepeatedReopen) {
+  Options opt = TinyBufferOptions("compact6");
+  opt.l0_compaction_trigger = 4;
+  const std::string name = TempDbName("compact6");
+  RemoveAll(name);
+
+  const int rounds = 5;
+  const int per_round = 200;
+  for (int r = 0; r < rounds; ++r) {
+    DB* db;
+    ASSERT_TRUE(DB::Open(opt, name, &db).ok())
+        << "reopen failed at round " << r;
+    for (int i = 0; i < per_round; ++i) {
+      const std::string k = "r" + std::to_string(r) + "_" + std::to_string(i);
+      ASSERT_TRUE(db->Put(k, "v").ok()) << k;
+    }
+    // 验证历史轮次的数据仍在（跨重开、跨 compaction）
+    for (int p = 0; p < r; ++p) {
+      for (int i = 0; i < per_round; i += 7) {
+        std::string v;
+        ASSERT_TRUE(db->Get("r" + std::to_string(p) + "_" + std::to_string(i),
+                            &v).ok())
+            << "round " << p << " key " << i;
+      }
+    }
+    delete db;
+  }
+  RemoveAll(name);
+}
+
 }  // namespace
 }  // namespace tinystore

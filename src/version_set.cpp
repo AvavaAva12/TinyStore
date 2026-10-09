@@ -69,6 +69,12 @@ Status VersionEdit::EncodeTo(std::string* dst) const {
     PutVarint64(dst, f.file_size);
     PutLengthPrefixedSlice(dst, f.smallest);
     PutLengthPrefixedSlice(dst, f.largest);
+    // 层号用独立的 tag 6 紧跟在该文件之后，而不是塞进 tag 3 的字段序列里。
+    // 这样 W4 之前写下的旧 MANIFEST 记录（没有 tag 6）依然能正常解析，
+    // level 取默认值 0 —— 也就是"旧数据都算 L0"，与当时的语义一致。
+    // 若把 level 混进 tag 3，旧记录就会因为少一个字段而整体错位。
+    dst->push_back(6);
+    PutVarint64(dst, static_cast<uint64_t>(f.level));
   }
   for (uint64_t n : deleted_files) {
     dst->push_back(4);
@@ -104,7 +110,16 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
         if (!GetLengthPrefixedSlice(&in, &b)) return Status::Corruption("version edit");
         f.smallest = a.ToString();
         f.largest = b.ToString();
-        new_files.push_back(f);
+        new_files.push_back(std::move(f));
+        break;
+      }
+      case 6: {
+        // 层号作用于"最近解析出来的那个文件"。若还没有文件，说明 MANIFEST
+        // 已经损坏（tag 6 脱离了它的 tag 3），直接报错而不是静默忽略。
+        uint64_t lvl = 0;
+        if (!GetVarint64(&in, &lvl)) return Status::Corruption("version edit");
+        if (new_files.empty()) return Status::Corruption("level tag without file");
+        new_files.back().level = static_cast<int>(lvl);
         break;
       }
       case 4: {
@@ -143,7 +158,7 @@ VersionSet::VersionSet(const std::string& dbname, Env* env,
 
 VersionSet::~VersionSet() {
   if (Version* v = current_.load(std::memory_order_acquire)) v->Unref();
-  for (auto& kv : table_cache_) delete kv.second;
+  for (auto& kv : table_cache_) delete kv.second.table;
   if (manifest_file_ != nullptr) {
     manifest_file_->Close();
     delete manifest_file_;
@@ -280,21 +295,55 @@ void VersionSet::AddLiveFiles(std::set<uint64_t>* live) {
   for (const auto& f : current_.load(std::memory_order_acquire)->files()) live->insert(f.number);
 }
 
-Table* VersionSet::GetTable(uint64_t number) {
-  std::lock_guard<std::mutex> lk(cache_mutex_);
-  auto it = table_cache_.find(number);
-  if (it != table_cache_.end()) return it->second;
-
+void VersionSet::OpenTableLocked(uint64_t number, Table** out) {
+  *out = nullptr;
   const std::string fname = Filename::MakeFileName(dbname_, number, "ldb");
   std::unique_ptr<RandomAccessFile> file;
-  if (!env_->NewRandomAccessFile(fname, &file).ok()) return nullptr;
+  if (!env_->NewRandomAccessFile(fname, &file).ok()) return;
   uint64_t size = 0;
-  if (!env_->GetFileSize(fname, &size).ok()) return nullptr;
+  if (!env_->GetFileSize(fname, &size).ok()) return;
+  if (!Table::Open(icmp_, std::move(file), size, out).ok()) *out = nullptr;
+}
 
-  Table* table = nullptr;
-  if (!Table::Open(icmp_, std::move(file), size, &table).ok()) return nullptr;
-  table_cache_[number] = table;
-  return table;
+Table* VersionSet::AcquireTable(uint64_t number) {
+  std::lock_guard<std::mutex> lk(cache_mutex_);
+  auto it = table_cache_.find(number);
+  if (it == table_cache_.end()) {
+    Table* t = nullptr;
+    OpenTableLocked(number, &t);
+    if (t == nullptr) return nullptr;
+    it = table_cache_.emplace(number, TableEntry{t, 0, false}).first;
+  }
+  // 已标记淘汰的文件不再交给新读者：它的内容已经被 compaction 取代，
+  // 新读者应该去读新的 Version 里的文件。
+  if (it->second.evicted) return nullptr;
+  ++it->second.refs;
+  return it->second.table;
+}
+
+void VersionSet::ReleaseTable(uint64_t number) {
+  std::lock_guard<std::mutex> lk(cache_mutex_);
+  auto it = table_cache_.find(number);
+  if (it == table_cache_.end()) return;
+  if (--it->second.refs > 0) return;
+  // 引用归零：只有被标记淘汰的才真正释放，其余留在缓存里复用
+  if (it->second.evicted) {
+    delete it->second.table;
+    table_cache_.erase(it);
+  }
+}
+
+void VersionSet::EvictTable(uint64_t number) {
+  std::lock_guard<std::mutex> lk(cache_mutex_);
+  auto it = table_cache_.find(number);
+  if (it == table_cache_.end()) return;
+  it->second.evicted = true;
+  // 没有读者时才立即释放；否则等最后一个 ReleaseTable。
+  // 直接 delete 会把并发读者手里的裸指针变成悬垂指针。
+  if (it->second.refs <= 0) {
+    delete it->second.table;
+    table_cache_.erase(it);
+  }
 }
 
 }  // namespace tinystore

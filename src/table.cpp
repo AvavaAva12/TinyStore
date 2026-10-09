@@ -133,6 +133,7 @@ void TableBuilder::Add(const Slice& key, const Slice& value) {
 
   data_block_.Add(key, value);
   last_key_.assign(key.data(), key.size());
+  ++num_entries_;
   if (smallest_key_.empty()) smallest_key_.assign(key.data(), key.size());
   largest_key_.assign(key.data(), key.size());
 

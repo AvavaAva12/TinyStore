@@ -10,6 +10,64 @@
 
 namespace tinystore {
 
+namespace {
+
+// Compaction 归并期间借用的一批 Table 引用。
+//
+// CompactLevel 里有好几条 return 路径（打不开文件、Sync 失败、提交失败……），
+// 每条都得归还引用，漏一条就会让 Table 永远无法释放。用 RAII 把这件事收口，
+// 声明在 DBIterator 之前即可保证"先析构迭代器、再归还引用"这个顺序——
+// 迭代器内部还指着 Table 的索引块，必须活到引用归还之后。
+class TableBorrow {
+ public:
+  explicit TableBorrow(VersionSet* vs) : vs_(vs) {}
+  ~TableBorrow() {
+    for (uint64_t n : nums_) vs_->ReleaseTable(n);
+  }
+
+  TableBorrow(const TableBorrow&) = delete;
+  TableBorrow& operator=(const TableBorrow&) = delete;
+
+  void Add(uint64_t n) { nums_.push_back(n); }
+
+ private:
+  VersionSet* const vs_;
+  std::vector<uint64_t> nums_;
+};
+
+// 给 Iterator 包一层：在迭代器销毁时归还它向 VersionSet 借用的 Table 引用。
+//
+// Iterator 接口没有析构钩子，而 Table 引用必须活到"迭代器不再使用 Table"之后
+// ——compaction 会在此期间把旧文件标记淘汰，光靠 Acquire/Release 配对还不够，
+// 必须让引用跟着迭代器的生命周期走。
+class TableReleasingIterator : public Iterator {
+ public:
+  TableReleasingIterator(std::unique_ptr<Iterator> inner, VersionSet* vs,
+                         std::vector<uint64_t> borrowed)
+      : inner_(std::move(inner)), vs_(vs), borrowed_(std::move(borrowed)) {}
+  ~TableReleasingIterator() override {
+    for (uint64_t n : borrowed_) vs_->ReleaseTable(n);
+  }
+
+  TableReleasingIterator(const TableReleasingIterator&) = delete;
+  TableReleasingIterator& operator=(const TableReleasingIterator&) = delete;
+
+  bool Valid() const override { return inner_->Valid(); }
+  void SeekToFirst() override { inner_->SeekToFirst(); }
+  void Seek(const Slice& target) override { inner_->Seek(target); }
+  void Next() override { inner_->Next(); }
+  Slice key() const override { return inner_->key(); }
+  Slice value() const override { return inner_->value(); }
+  Status status() const override { return inner_->status(); }
+
+ private:
+  std::unique_ptr<Iterator> inner_;
+  VersionSet* const vs_;
+  std::vector<uint64_t> borrowed_;
+};
+
+}  // namespace
+
 // ===========================================================================
 // DBImpl 实现
 // ===========================================================================
@@ -274,6 +332,252 @@ Status DBImpl::CompactMemTable() {
 }
 
 // ---------------------------------------------------------------------------
+// Compaction：把 level 层的文件与 level+1 层重叠文件归并成新的 level+1 文件
+// ---------------------------------------------------------------------------
+//
+// 【为什么必须有这一步】
+// flush 只会新增 SSTable、从不删除。写 1M 条数据就会得到上千个文件，而点查
+// 最坏要把它们全看一遍（布隆过滤器能跳过大部分，但文件本身的打开、读 footer、
+// 读索引块都是实打实的 IO）。Compaction 把多个文件合并成少数几个，文件数因此
+// 从"正比于写入总量"降到"正比于数据总量 / 单文件大小"。
+//
+// 【L0 与更高层的区别】
+// L0 文件来自 flush，键范围互相重叠，所以查询要整层扫；更高层由 compaction
+// 产出，文件之间键范围互不重叠，查询可以二分定位到唯一文件。
+uint64_t DBImpl::LevelCapacity(int level) const {
+  if (level <= 0) {
+    // L0 不用容量触发，只用文件数触发（见 NeedsCompaction）：
+    // L0 的问题在"文件多且重叠"而非"字节多"。
+    return 0;
+  }
+  uint64_t cap = options_.max_level_bytes;
+  for (int i = 1; i < level; ++i) {
+    if (cap > UINT64_MAX / options_.max_level_bytes_multiplier) {
+      return UINT64_MAX;  // 防溢出：层数很深时直接封顶
+    }
+    cap *= options_.max_level_bytes_multiplier;
+  }
+  return cap;
+}
+
+int DBImpl::PickCompactionLevel(const Version* v) const {
+  if (v->NumLevelFiles(0) >= options_.l0_compaction_trigger) return 0;
+  for (int lvl = 1; lvl < options_.max_num_levels; ++lvl) {
+    if (v->LevelBytes(lvl) > LevelCapacity(lvl)) return lvl;
+  }
+  return -1;
+}
+
+// 判断 [a.smallest, a.largest] 与 [b.smallest, b.largest] 是否键范围重叠。
+static bool RangesOverlap(const InternalKeyComparator* icmp,
+                          const FileMetaData& a, const FileMetaData& b) {
+  // a 的最小 > b 的最大  =>  a 全在 b 右边
+  if (icmp->Compare(a.smallest, b.largest) > 0) return false;
+  // a 的最大 < b 的最小  =>  a 全在 b 左边
+  if (icmp->Compare(a.largest, b.smallest) < 0) return false;
+  return true;
+}
+
+Status DBImpl::CompactLevel(int level) {
+  const int next_level = level + 1;
+  const bool next_is_final = (next_level >= options_.max_num_levels - 1);
+
+  // 1) 选源文件。L0 整体参与；更高层只挑一个文件（挑最小的那个最划算，
+  //    因为它归并后能最快沉到下一层）。
+  std::vector<const FileMetaData*> inputs;
+  {
+    Version* v = versions_->current();
+    if (v->files().empty()) {
+      v->Unref();
+      return Status::OK();
+    }
+    for (const auto* f : v->FilesAtLevel(level)) inputs.push_back(f);
+    v->Unref();
+  }
+  if (inputs.empty()) return Status::OK();
+  if (level > 0 && inputs.size() > 1) {
+    const FileMetaData* smallest =
+        *std::min_element(inputs.begin(), inputs.end(),
+                          [](const FileMetaData* a, const FileMetaData* b) {
+                            return a->number < b->number;
+                          });
+    inputs.assign(1, smallest);
+  }
+
+  // 2) 选下一层中与源文件范围重叠的文件。这些文件要被源文件的新版本覆盖，
+  //    所以必须一起参与归并，否则旧版本会"复活"。
+  std::vector<uint64_t> input_numbers;
+  std::vector<const FileMetaData*> inputs_next;
+  {
+    Version* v = versions_->current();
+    for (const auto* f : inputs) input_numbers.push_back(f->number);
+    for (const auto* g : v->FilesAtLevel(next_level)) {
+      bool overlaps = false;
+      for (const auto* f : inputs) {
+        if (RangesOverlap(&icmp_, *f, *g)) {
+          overlaps = true;
+          break;
+        }
+      }
+      if (overlaps) {
+        inputs_next.push_back(g);
+        input_numbers.push_back(g->number);
+      }
+    }
+    v->Unref();
+  }
+
+  // 3) 归并。用 DBIterator 串起所有输入源：它按 internal_key 有序归并，并自动
+  //    过滤掉被更新的旧版本与墓碑，输出的正是"该文件最终形态"的内容。
+  //    snapshot 用 kMaxSequenceNumber 表示"要全部可见"，因为这里要的是
+  //    把所有版本压平成最新状态，而不是某个时刻的视图。
+  std::vector<FileMetaData> outputs;
+  {
+    // borrow 先声明、merged 后声明 => 析构时 merged 先走、borrow 再归还引用。
+    TableBorrow borrow(versions_);
+    DBIterator merged(&icmp_, kMaxSequenceNumber);
+    for (uint64_t num : input_numbers) {
+      Table* t = versions_->AcquireTable(num);
+      if (t == nullptr) continue;  // 打不开就跳过，与 Get 的处理一致
+      borrow.Add(num);
+      merged.AddChild(t->NewIterator());
+    }
+    std::unique_ptr<WritableFile> out_file;
+    std::unique_ptr<TableBuilder> builder;
+    uint64_t out_number = 0;
+
+    // 开始一个新输出文件
+    auto start_output = [&]() -> Status {
+      out_number = versions_->NewFileNumber();
+      const std::string fname =
+          Filename::MakeFileName(dbname_, out_number, "ldb");
+      std::unique_ptr<WritableFile> f;
+      Status s = env_->NewWritableFile(fname, &f);
+      if (!s.ok()) return s;
+      out_file = std::move(f);
+      builder = std::make_unique<TableBuilder>(&icmp_, out_file.get(),
+                                               options_.filter_policy,
+                                               options_.block_size);
+      return Status::OK();
+    };
+
+    // 收尾当前输出文件并登记元数据
+    auto finish_output = [&]() -> Status {
+      if (builder == nullptr) return Status::OK();
+      FileMetaData meta;
+      meta.number = out_number;
+      meta.level = next_level;
+      // 注意：空输出（例如全部键都被删光）是合法且必要的结果——
+      // compaction 正是回收墓碑、把空间还给系统的地方。
+      if (builder->NumEntries() == 0) {
+        env_->DeleteFile(Filename::MakeFileName(dbname_, out_number, "ldb"));
+      } else {
+        Status s = builder->Finish();
+        if (s.ok()) s = out_file->Sync();
+        if (!s.ok()) {
+          env_->DeleteFile(Filename::MakeFileName(dbname_, out_number, "ldb"));
+          return s;
+        }
+        meta.file_size = builder->FileSize();
+        meta.smallest = builder->SmallestKey();
+        meta.largest = builder->LargestKey();
+        outputs.push_back(std::move(meta));
+      }
+      out_file.reset();
+      builder.reset();
+      return Status::OK();
+    };
+
+    merged.SeekToFirst();
+    Status s;
+    for (; merged.Valid(); merged.Next()) {
+      if (!s.ok()) s = merged.status();
+      if (!s.ok()) break;
+      if (builder == nullptr) {
+        s = start_output();
+        if (!s.ok()) break;
+      }
+      // 必须写 internal key 而不是 merged.key()（那是 user_key）：
+      // SSTable 的键空间是 internal key，缺了 8 字节的 seq/type 后缀，
+      // TableBuilder 内部的 FindShortestSeparator 会把它当 internal key 解析而断言失败，
+      // 更关键的是压缩后版本号丢失、快照读直接失效。
+      builder->Add(merged.internal_key(), merged.value());
+      // 写满一个目标大小就切分下一个文件，避免产出巨型 SSTable
+      if (builder->FileSize() >= options_.max_compaction_file_size) {
+        s = finish_output();
+        if (!s.ok()) break;
+      }
+    }
+    if (s.ok() && builder != nullptr) {
+      s = finish_output();
+    }
+    if (!s.ok()) {
+      // 失败清理：把本次已产出的文件删掉，避免留下未登记的孤儿
+      for (const auto& m : outputs) {
+        env_->DeleteFile(Filename::MakeFileName(dbname_, m.number, "ldb"));
+      }
+      return s;
+    }
+  }
+
+  // 4) 原子提交：MANIFEST 里同时记录"新增输出文件"和"删除源文件"。
+  //    这条记录落盘之前崩溃，旧文件仍在、新文件只是孤儿，重启后会被清理；
+  //    落盘之后崩溃，两边都已登记，数据完整。绝不能分两次提交。
+  VersionEdit edit;
+  edit.sequence = last_sequence_.load(std::memory_order_relaxed);
+  edit.has_sequence = true;
+  for (const auto& m : outputs) edit.new_files.push_back(m);
+  for (uint64_t num : input_numbers) edit.deleted_files.push_back(num);
+
+  Status s = versions_->LogAndApply(&edit);
+  if (!s.ok()) {
+    for (const auto& m : outputs) {
+      env_->DeleteFile(Filename::MakeFileName(dbname_, m.number, "ldb"));
+    }
+    return s;
+  }
+
+  // 5) 新版本已生效，此刻才安全地删旧文件：必须先从 table_cache_ 摘除
+  //    （EvictTable），否则缓存里会留下指向已删文件的悬垂 Table*。
+  for (uint64_t num : input_numbers) {
+    versions_->EvictTable(num);
+    env_->DeleteFile(Filename::MakeFileName(dbname_, num, "ldb"));
+  }
+  return Status::OK();
+}
+
+// ---------------------------------------------------------------------------
+// 统计与自省：让 Compaction 的效果可被测试直接断言
+// ---------------------------------------------------------------------------
+
+std::vector<size_t> DBImpl::GetLevelFileCounts() const {
+  Version* v = versions_->current();
+  std::vector<size_t> out;
+  for (int lvl = 0; lvl < options_.max_num_levels; ++lvl) {
+    out.push_back(static_cast<size_t>(v->NumLevelFiles(lvl)));
+  }
+  v->Unref();
+  return out;
+}
+
+std::vector<size_t> DBImpl::GetLevelBytes() const {
+  Version* v = versions_->current();
+  std::vector<size_t> out;
+  for (int lvl = 0; lvl < options_.max_num_levels; ++lvl) {
+    out.push_back(static_cast<size_t>(v->LevelBytes(lvl)));
+  }
+  v->Unref();
+  return out;
+}
+
+size_t DBImpl::NumTableFiles() const {
+  Version* v = versions_->current();
+  const size_t n = v->files().size();
+  v->Unref();
+  return n;
+}
+
+// ---------------------------------------------------------------------------
 // Write：Group Commit（同 W3）+ 阈值触发 flush
 // ---------------------------------------------------------------------------
 Status DBImpl::Write(const WriteBatch& my_batch) {
@@ -326,6 +630,27 @@ Status DBImpl::Write(const WriteBatch& my_batch) {
     // W4：MemTable 涨过阈值则 flush（在持有 mutex_ 的 leader 里同步完成）
     if (m->ApproximateMemoryUsage() > options_.write_buffer_size) {
       s = CompactMemTable();
+    }
+
+    // W6：flush 之后顺手看看要不要压缩。
+    //
+    // 【为什么是循环而不是 if】
+    // 一次 L0->L1 可能把 L1 顶过它的容量上限（本来只差一点点），
+    // 于是还要继续 L1->L2。用循环把这次写请求顺带能完成的压缩都做完，
+    // 避免"写一次、压缩要等下次写"这种不必要的滞后。
+    // guard 只是防御性上限：正常情况下层数有限，几次就收敛了。
+    if (s.ok()) {
+      for (int guard = 0; guard < 32; ++guard) {
+        int trigger = -1;
+        {
+          Version* cur = versions_->current();
+          trigger = PickCompactionLevel(cur);
+          cur->Unref();
+        }
+        if (trigger < 0) break;
+        s = CompactLevel(trigger);
+        if (!s.ok()) break;
+      }
     }
   }
 
@@ -389,13 +714,15 @@ Status DBImpl::Get(const Slice& key, std::string* value) {
   const FilterPolicy* fp = options_.filter_policy;
   for (int i = static_cast<int>(v->files().size()) - 1; i >= 0; --i) {
     const FileMetaData& f = v->files()[i];
-    Table* table = versions_->GetTable(f.number);
-    // GetTable 打不开时只能跳过：它的接口没有 Status 出口，
-    // 无法区分"文件确实不在（孤儿清理后合法缺失）"与"文件损坏"。
-    // 要真正区分，需要 W5 把 GetTable 改成返回 Status。
+    Table* table = versions_->AcquireTable(f.number);
+    // AcquireTable 拿不到时只能跳过：可能是文件已被 compaction 淘汰
+    // （此时新版本里有它的替身），也可能文件确实打不开。
     if (table == nullptr) continue;
     bool tfound = false;
     Status ts = table->Get(key, snapshot, fp, value, &tfound);
+    // 用完立刻归还引用：否则 compaction 淘汰该文件时，这个 Table 永远等不到
+    // 引用归零，既释放不掉内存，也会让缓存无限膨胀。
+    versions_->ReleaseTable(f.number);
     if (tfound) {  // 本文件确有该 key 在 snapshot 下的版本（值或删除）-> 停止
       v->Unref();
       return ts;
@@ -442,12 +769,18 @@ std::unique_ptr<Iterator> DBImpl::NewIterator(const ReadOptions& options) const 
 
   // SSTable：从新到旧全部加入。L0 文件之间 key 范围可能重叠，交由归并处理，
   // 因此这里不需要（也不能）按范围裁剪——遍历就该看到全量数据。
+  std::vector<uint64_t> borrowed;
   for (int i = static_cast<int>(v->files().size()) - 1; i >= 0; --i) {
-    Table* t = versions_->GetTable(v->files()[i].number);
+    Table* t = versions_->AcquireTable(v->files()[i].number);
     if (t == nullptr) continue;  // 打不开的文件跳过，与 Get 的处理一致
+    borrowed.push_back(v->files()[i].number);
     it->AddChild(t->NewIterator());
   }
   v->Unref();
+
+  // 包一层，让这些引用跟着迭代器的生命周期走（见 TableReleasingIterator 注释）。
+  return std::make_unique<TableReleasingIterator>(std::move(it), versions_,
+                                                  std::move(borrowed));
 
   it->SeekToFirst();
   return it;

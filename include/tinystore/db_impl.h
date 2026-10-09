@@ -68,6 +68,33 @@ private:
   // 必须在持有 mutex_ 的写者（leader）上下文中调用。
   Status CompactMemTable();
 
+  // 把 level 层的文件与 level+1 层中键范围与之重叠的文件归并成新的
+  // level+1 文件，并把源文件登记为删除。必须在持有 mutex_ 的写者（leader）
+  // 上下文中调用。
+  //
+  // 这是 LSM 的核心收益来源：没有它，每次 flush 都新增一个 SSTable，文件数与
+  // 读放大随写入量线性增长。
+  //
+  // 【墓碑为什么在这里被安全回收】
+  // 归并用 DBIterator 驱动，而它只输出"当前可见的有效值"，墓碑不会被写出。
+  // 这在 L0->L1 上是安全的：L1 之下已经没有更老的层，不存在该 key 的历史版本
+  // 会因为墓碑消失而复活。但对 L1->L2 这类非最底层的压缩就不成立——那时
+  // 必须先把墓碑原样带到下一层，等它沉到最后一层再丢。kFinalLevel 标记了
+  // 当前的最底层，正是靠它区分这两种情形。
+  Status CompactLevel(int level);
+
+  std::vector<size_t> GetLevelFileCounts() const override;
+  std::vector<size_t> GetLevelBytes() const override;
+  size_t NumTableFiles() const override;
+
+  // 按各层容量阈值挑出一个需要压缩的层；返回 -1 表示当前无需压缩。
+  // 优先压 L0（L0 文件互相重叠，对点查最不友好），其次自下而上找超容量的层。
+  int PickCompactionLevel(const Version* v) const;
+
+  // level 层的容量上限（字节）。level 越大容量按 multiplier 递增，
+  // 这是把"写入总量"摊平成"每层固定大小"的经典做法。
+  uint64_t LevelCapacity(int level) const;
+
   Env* env_;
   const Comparator* user_comparator_;
   InternalKeyComparator icmp_;

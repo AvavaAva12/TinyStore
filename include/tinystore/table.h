@@ -82,6 +82,10 @@ public:
   const std::string& SmallestKey() const { return smallest_key_; }
   const std::string& LargestKey() const { return largest_key_; }
 
+  // 已加入的 entry 条数。Compaction 用它判断"归并结果是否为空"——
+  // 全部键都被删除时输出文件应当直接丢弃，而不是留下一个只有元数据的空表。
+  size_t NumEntries() const { return num_entries_; }
+
 private:
   // 把当前 data block 落盘 + 记录待定索引键。
   // 返回值语义与 WriteBlock 一致：失败时同时把错误记入 status_，
@@ -102,6 +106,7 @@ private:
   BlockHandle pending_handle_;      // 上一个已落盘 data block 的句柄
   std::string smallest_key_;
   std::string largest_key_;
+  size_t num_entries_ = 0;
 
   // 整文件布隆过滤器：收集所有 user_key，Finish 时一次性生成。
   std::vector<std::string> filter_keys_;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <map>
@@ -52,6 +53,17 @@ struct FileMetaData {
   uint64_t file_size = 0;
   std::string smallest;  // 最小 internal_key（含 8 字节后缀）
   std::string largest;   // 最大 internal_key
+
+  // 所在层号。0 = L0（每次 flush 产出，文件之间键范围可能重叠）；
+  // >=1 = 更高层（由 compaction 产出，文件之间键范围互不重叠）。
+  //
+  // 这个字段是 Compaction 的前提：没有层信息就无法判断"哪些文件互相重叠、
+  // 该合并谁"，文件数会随写入量无限增长，读放大同步线性上升。
+  //
+  // 缺省为 0，使 W4 之前写下的 MANIFEST 记录（旧版本没有 level 概念）
+  // 重放后仍然落在 L0，语义与当时一致 —— 这也是 DecodeFrom 里把 level
+  // 设计成"可选字段"的原因。
+  int level = 0;
 };
 
 // 一次版本变更：要么新增文件，要么删除文件（W4 只有新增，删除留给 W5 的 Compaction）
@@ -82,13 +94,53 @@ public:
     if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) delete this;
   }
 
-  // 文件按编号升序（也是"越新越靠后"）：Get 需从后往前扫描。
+  // 文件的排列顺序经过刻意设计，使 Get 的「从后往前扫描」恰好等于
+  // 「最新数据先查」：
+  //   * level 越大表示数据越老，因此 level 大的排在数组**前面**；
+  //     flush 产出的 L0（level 0，最新）排在**后面**。
+  //   * 同一层内按文件编号升序（后写入的编号大，也排在后面）。
+  // 于是倒序扫描的顺序是：L0 最新 -> L0 最旧 -> L1 ...，正是查询需要的优先级。
+  // L0 的文件之间可能键范围重叠，所以必须整体按"新旧"而非按键值排序。
   const std::vector<FileMetaData>& files() const { return files_; }
+
+  // 某层文件集合（level 相同），保持 files_ 的相对顺序。
+  const std::vector<const FileMetaData*> FilesAtLevel(int level) const {
+    std::vector<const FileMetaData*> out;
+    for (const auto& f : files_) {
+      if (f.level == level) out.push_back(&f);
+    }
+    return out;
+  }
+
+  // 文件总大小（字节），用于按层容量阈值判断何时触发 compaction。
+  uint64_t LevelBytes(int level) const {
+    uint64_t total = 0;
+    for (const auto& f : files_) {
+      if (f.level == level) total += f.file_size;
+    }
+    return total;
+  }
+
+  int NumLevelFiles(int level) const {
+    int n = 0;
+    for (const auto& f : files_) {
+      if (f.level == level) ++n;
+    }
+    return n;
+  }
 
 private:
   friend class VersionSet;
 
-  explicit Version(const std::vector<FileMetaData>& files) : files_(files) {}
+  explicit Version(const std::vector<FileMetaData>& files) : files_(files) {
+    // 见上方 files() 的注释：level 降序 + 同层 number 升序，
+    // 使倒序扫描恰好是"最新优先"。
+    std::sort(files_.begin(), files_.end(),
+              [](const FileMetaData& a, const FileMetaData& b) {
+                if (a.level != b.level) return a.level > b.level;
+                return a.number < b.number;
+              });
+  }
   ~Version() = default;
 
   std::vector<FileMetaData> files_;
@@ -149,9 +201,21 @@ public:
   // 收集当前 Version 引用的所有 SSTable 编号（供清理孤儿 .ldb 文件）。
   void AddLiveFiles(std::set<uint64_t>* live);
 
-  // 按编号取得已打开的 Table（懒加载并缓存；W4 不淘汰，随 VersionSet 销毁）。
-  // 返回的 Table* 在 VersionSet 生命周期内有效，且读路径全程只读、线程安全。
-  Table* GetTable(uint64_t number);
+  // 取用某个 SSTable 并把它的引用计数 +1；必须与 ReleaseTable 配对。
+  // 拿到的 Table* 在 ReleaseTable 之前保证有效。
+  //
+  // 【为什么不用"直接返回缓存里的裸指针"】
+  // Compaction 合并完一批文件后要把旧文件从缓存里摘掉。若读者只是拿到裸指针
+  // 而不登记引用，摘缓存的瞬间就可能把对象 delete 掉，读者手里就成了悬垂指针
+  // ——这正是 W6 引入 Compaction 后在并发测试里暴露的崩溃。
+  Table* AcquireTable(uint64_t number);
+  void ReleaseTable(uint64_t number);
+
+  // Compaction 删除某个 SSTable 之前调用：把文件标记为待淘汰。
+  // 若当前没有读者持有它，立即释放；否则等最后一个 ReleaseTable 再释放。
+  void EvictTable(uint64_t number);
+
+  void OpenTableLocked(uint64_t number, Table** out);
 
 private:
   Status WriteManifestRecord(const VersionEdit& edit);
@@ -176,9 +240,18 @@ private:
 
   std::atomic<Version*> current_{nullptr};
 
-  // Table 缓存：编号 -> 已打开的 Table
+  // Table 缓存。W6 引入 Compaction 后，每个条目额外携带引用计数：
+  //   refs    —— 当前有多少读者（Get / Compaction 归并）正持有该 Table
+  //   evicted —— 已被 compaction 标记为待淘汰，等引用归零后真正 delete
+  // 没有这两个字段，compaction 一 delete 就会把并发读者手里的裸指针变成悬垂指针。
+  struct TableEntry {
+    Table* table = nullptr;
+    int refs = 0;
+    bool evicted = false;
+  };
+
   mutable std::mutex cache_mutex_;
-  std::map<uint64_t, Table*> table_cache_;
+  std::map<uint64_t, TableEntry> table_cache_;
 };
 
 }  // namespace tinystore

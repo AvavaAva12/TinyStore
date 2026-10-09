@@ -54,6 +54,10 @@ public:
   // Iterator 接口
   bool Valid() const override { return valid_; }
   Slice key() const override { return Slice(cur_key_); }
+
+  // 完整 internal key（user_key + 8 字节 seq/type 后缀）。
+  // 只给 Compaction 用：归并时必须把版本号原样写进新 SSTable，否则快照读失效。
+  Slice internal_key() const { return Slice(cur_internal_key_); }
   Slice value() const override { return Slice(cur_value_); }
   Status status() const override { return status_; }
 
@@ -116,11 +120,15 @@ private:
       // 否则会把上一次的 key/value 当成本轮结果返回。
       const bool emitted = (parsed.type == kTypeValue);
       if (emitted) {
-        // 拷贝而非返回子迭代器的 Slice：调用方可能在 Next 之后才用这两个值，
-        // 而子迭代器的缓冲区已经移动了。拷贝只发生在每个输出项上。
+        // 对外暴露的是 user_key（用户不该看到 8 字节的版本后缀）。
         cur_key_.assign(parsed.user_key.data(), parsed.user_key.size());
         const Slice v = children_[idx]->value();
         cur_value_.assign(v.data(), v.size());
+        // 同时保留完整 internal key：Compaction 要把它原样写进新 SSTable，
+        // 而 SSTable 的键必须是 internal key。若这里只留 user_key，compaction
+        // 就无法在压缩时保住 version 号，历史快照读会失效。
+        cur_internal_key_.clear();
+        AppendInternalKey(&cur_internal_key_, parsed);
         valid_ = true;
       }
       // 【必须拷贝 user_key 再传给 SkipRestOfUserKey】
@@ -177,8 +185,9 @@ private:
   const InternalKeyComparator* icmp_;
   SequenceNumber snapshot_;
   std::vector<std::unique_ptr<Iterator>> children_;
-  std::string cur_key_;
+  std::string cur_key_;          // 对外的 user_key
   std::string cur_value_;
+  std::string cur_internal_key_;  // Compaction 用：含 seq/type 后缀的完整键
   bool valid_ = false;
   Status status_;
 };
