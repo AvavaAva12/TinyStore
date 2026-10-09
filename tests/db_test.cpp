@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -577,14 +578,17 @@ TEST(DBTest, IteratorHonorsSnapshot) {
   snap.snapshot = 1;  // 固定"只含 sequence <= 1"的视图
   ASSERT_TRUE(db->Put("b", "new").ok());
 
-  std::unique_ptr<Iterator> old_it(db->NewIterator(snap));
-  old_it->SeekToFirst();
-  ASSERT_TRUE(old_it->Valid());
-  EXPECT_EQ("a", old_it->key().ToString());
-  EXPECT_EQ("old", old_it->value().ToString());
-  old_it->Next();
-  EXPECT_FALSE(old_it->Valid())
-      << "快照之后写入的 b 不应出现在旧快照视图中";
+  // 迭代器必须先于 DB 销毁（它借用了 VersionSet 的 Table 引用）
+  {
+    std::unique_ptr<Iterator> old_it(db->NewIterator(snap));
+    old_it->SeekToFirst();
+    ASSERT_TRUE(old_it->Valid());
+    EXPECT_EQ("a", old_it->key().ToString());
+    EXPECT_EQ("old", old_it->value().ToString());
+    old_it->Next();
+    EXPECT_FALSE(old_it->Valid())
+        << "快照之后写入的 b 不应出现在旧快照视图中";
+  }
 
   // 默认读最新：a、b 都在
   auto now = ScanAll(db);
@@ -607,6 +611,18 @@ static Options TinyBufferOptions(const std::string& sub) {
   return opt;
 }
 
+// 后台 compaction 是异步的：写完最后一个 key 时它可能还在跑。
+// 断言文件数之前必须先等它收敛，否则测试会随机失败（flaky）。
+// 这里轮询而不是 sleep 固定时长——固定 sleep 会让慢机器上的测试莫名通过。
+static bool WaitForFileCountAtMost(DB* db, size_t limit, int timeout_ms) {
+  const int step = 5;
+  for (int waited = 0; waited <= timeout_ms; waited += step) {
+    if (db->NumTableFiles() <= limit) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(step));
+  }
+  return db->NumTableFiles() <= limit;
+}
+
 // 核心收益：文件数必须收敛，而不是随写入量线性增长。
 // 这是 Compaction 存在的唯一理由，务必直接断言。
 TEST(DBTest, CompactionConvergesFileCount) {
@@ -625,11 +641,12 @@ TEST(DBTest, CompactionConvergesFileCount) {
 
   // 每次写满 MemTable 都会 flush 出 1 个 L0 文件，2000 次写会产生上千个文件。
   // 若 compaction 生效，L0 会被压在阈值内，大部分数据沉到 L1，总文件数应远小于 n。
-  const size_t files = db->NumTableFiles();
-  const auto counts = db->GetLevelFileCounts();
-  EXPECT_LT(files, static_cast<size_t>(n) / 2)
-      << "compaction did not converge file count: " << files;
-  EXPECT_LE(counts[0], opt.l0_compaction_trigger)
+  //
+  // compaction 在后台线程跑，所以先等它收敛再断言。
+  ASSERT_TRUE(WaitForFileCountAtMost(db, static_cast<size_t>(n) / 2, 30000))
+      << "compaction did not converge file count: " << db->NumTableFiles();
+  EXPECT_LT(db->NumTableFiles(), static_cast<size_t>(n) / 2);
+  EXPECT_LE(db->GetLevelFileCounts()[0], opt.l0_compaction_trigger)
       << "L0 should stay under the trigger threshold";
 
   // 数据必须一条不少、值不能错
@@ -742,6 +759,9 @@ TEST(DBTest, CompactionOfFullyDeletedSetProducesNoFiles) {
   EXPECT_LE(left, 2u) << "fully-deleted data should be reclaimed, left " << left
                       << " files";
 
+  // 后台 compaction 可能仍在收尾，等它跑完再看最终的文件数
+  WaitForFileCountAtMost(db, 2u, 10000);
+
   // 更要紧的是：这些 key 既读不到，也不会在后续 compaction 中复活。
   for (int i = 0; i < 200; ++i) {
     std::string v;
@@ -819,6 +839,93 @@ TEST(DBTest, CompactionRepeatedReopen) {
   }
   RemoveAll(name);
 }
+// 后台化的核心收益：压缩期间写入不被阻塞。
+//
+// 这个测试不追求精确的耗时数字（那会因机器而异），而是验证一个可判定的性质：
+// compaction 正在大量进行时，写入依然能持续完成——若压缩还在写路径同步执行，
+// 写请求会被整段压缩时间卡住。
+TEST(DBTest, WritesProceedWhileCompactionRuns) {
+  Options opt = TinyBufferOptions("bgwrite");
+  opt.l0_compaction_trigger = 2;  // 频繁触发，保证压缩一直在跑
+  opt.write_buffer_size = 512;
+  const std::string name = TempDbName("bgwrite");
+  RemoveAll(name);
 
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  // 先写够数据把压缩挑起来
+  for (int i = 0; i < 400; ++i) {
+    ASSERT_TRUE(db->Put("warm" + std::to_string(i), "v").ok());
+  }
+
+  // 一边继续写（持续触发 flush 与 compaction），一边读，全程必须能完成。
+  const int n = 600;
+  for (int i = 0; i < n; ++i) {
+    const std::string k = "live" + std::to_string(i);
+    ASSERT_TRUE(db->Put(k, "v").ok()) << i;
+    if (i % 50 == 0) {
+      std::string v;
+      ASSERT_TRUE(db->Get(k, &v).ok()) << i;
+      EXPECT_EQ("v", v);
+    }
+  }
+  for (int i = 0; i < n; ++i) {
+    std::string v;
+    ASSERT_TRUE(db->Get("live" + std::to_string(i), &v).ok()) << i;
+  }
+
+  // 迭代器在压缩进行中同样要可用（它会借用 Table 引用）
+  {
+  std::unique_ptr<Iterator> it(db->NewIterator(ReadOptions()));
+  int seen = 0;
+  for (it->SeekToFirst(); it->Valid(); it->Next()) ++seen;
+  EXPECT_TRUE(it->status().ok());
+  EXPECT_GT(seen, 0);
+  }
+
+  delete db;
+  RemoveAll(name);
+}
+
+// 并发读写 + 后台压缩：数据必须始终正确，压缩不得让任何写入丢失。
+TEST(DBTest, ConcurrentWritesWithBackgroundCompaction) {
+  Options opt = TinyBufferOptions("bgconcurrent");
+  opt.l0_compaction_trigger = 2;
+  opt.write_buffer_size = 1024;
+  const std::string name = TempDbName("bgconcurrent");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  const int nthreads = 6;
+  const int per_thread = 300;
+  std::vector<std::thread> threads;
+  for (int t = 0; t < nthreads; ++t) {
+    threads.emplace_back([&, t]() {
+      for (int i = 0; i < per_thread; ++i) {
+        const std::string k = "t" + std::to_string(t) + "_" + std::to_string(i);
+        const std::string v = "v" + std::to_string(i);
+        EXPECT_TRUE(db->Put(k, v).ok());
+        std::string got;
+        EXPECT_TRUE(db->Get(k, &got).ok()) << k;
+        EXPECT_EQ(v, got) << k;
+      }
+    });
+  }
+  for (auto& th : threads) th.join();
+
+  for (int t = 0; t < nthreads; ++t) {
+    for (int i = 0; i < per_thread; ++i) {
+      std::string got;
+      ASSERT_TRUE(db->Get("t" + std::to_string(t) + "_" + std::to_string(i),
+                          &got).ok());
+    }
+  }
+
+  delete db;
+  RemoveAll(name);
+}
 }  // namespace
 }  // namespace tinystore

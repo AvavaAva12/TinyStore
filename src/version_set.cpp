@@ -265,9 +265,8 @@ Status VersionSet::Recover(std::set<uint64_t>* live_files) {
 }
 
 Status VersionSet::LogAndApply(VersionEdit* edit) {
-  // 调用方（DBImpl）负责把当前已提交的最大 sequence 填进 edit，随本条记录一起落盘，
-  // 崩溃恢复才能还原快照点。这里只消费它，不能覆盖——VersionSet 自己的
-  // last_sequence_ 只在 Recover 时被填充，运行期并不跟踪写入进度。
+  // 串行化整个提交流程：后台 compaction 与前台 flush 可能并发调用。
+  std::lock_guard<std::mutex> edit_lk(version_edit_mutex_);
   Status s = WriteManifestRecord(*edit);
   if (!s.ok()) return s;
 

@@ -99,6 +99,7 @@ TinyStore/
 | **fix(W4)** | 代码审查缺陷修复：静默丢数据、RCU use-after-free、整数溢出绕过等 | ✅ 完成 |
 | **W5** | 迭代器：`DB::NewIterator` + SSTable 遍历 + 跨源归并 + MVCC 过滤 + 快照读 | ✅ 完成 |
 | **W6** | Compaction：Leveled 策略 + 墓碑回收 + TableCache 引用计数 | ✅ 完成 |
+| **W7** | Compaction 后台化：`Env::Schedule` + 生命周期安全等待 | ✅ 完成 |
 
 > 说明：原规划把「读路径 / BloomFilter」列为 W5、「Flush / Version / MANIFEST」列为 W6。
 > 实际执行时这两块内容合并进了 W4 一次提交（原 W5、W6 的条目已不再单列）。
@@ -108,8 +109,7 @@ TinyStore/
 
 | 优先级 | 主题 | 动机 / 现状缺口 |
 |---|---|---|
-| **P1** | **Compaction 后台化** | W6 的 compaction 在写路径的 leader 里**同步**执行：期间阻塞所有写入，大数据集下尾延迟很差。需移到 `Env::Schedule` 后台线程，并用独立 mutex 避开与 Group Commit 抢锁 |
-| **P1** | **Compaction 优先级与限流** | 当前"谁的 L0 先满就先压谁"，没有按"最该压的优先"排序；也没有 IO 限流，压缩与前台写入互相抢磁盘带宽 |
+| **P1** | **Compaction 优先级与限流** | W7 已把压缩挪到后台线程。当前"谁的层先超阈值就先压谁"，没有按收益排序；也没有 IO 限流，压缩与前台写入仍会互相抢磁盘带宽 |
 | **P1** | **迭代器反向遍历**（`Prev` / `SeekToLast`） | W5 已完成正向遍历。反向需 SSTable 能反向定位并倒序扫描块，而前缀压缩让倒序扫描需要额外维护解压栈，属独立工作量 |
 | **P1** | **TableCache LRU 淘汰** | W6 已加引用计数使淘汰变得安全，但缓存仍只增不减、不按容量淘汰，长期运行内存无上限。需 LRU + 容量上限 |
 | **P1** | **Snapshot 句柄 API** | `ReadOptions.snapshot` 已能按序号做历史读（W5），但缺 `GetSnapshot()` / `ReleaseSnapshot()` 这样的生命周期句柄，无法表达"先取快照、再做别的、最后按快照读"这一自然用法 |

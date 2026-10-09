@@ -1,6 +1,10 @@
 #include "tinystore/db_impl.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <thread>
 #include <set>
 #include <vector>
 
@@ -82,6 +86,10 @@ DBImpl::DBImpl(const Options& options, const std::string& name)
 }
 
 DBImpl::~DBImpl() {
+  // 必须先等后台 compaction 彻底结束。它是一个捕获了 this 的后台任务，
+  // 若在 DB 析构后仍去访问 versions_ / compaction_mu_，就是 use-after-free。
+  WaitForBackgroundCompaction();
+
   // 兜底 Sync 活跃 WAL（每次 Write 已 fsync，这里只是双保险）
   if (logfile_ != nullptr) {
     logfile_->Sync();
@@ -547,6 +555,88 @@ Status DBImpl::CompactLevel(int level) {
 }
 
 // ---------------------------------------------------------------------------
+// 后台 compaction：写路径只负责"判断 + 投任务"，IO 全在后台线程
+// ---------------------------------------------------------------------------
+
+void DBImpl::MaybeScheduleCompaction() {
+  // 占位、判断、投递放在同一个临界区：这样"已投递"与"已占位"严格等价，
+  // 析构时才能用 active_compactions_ 判断"没有任务在跑"。
+  std::lock_guard<std::mutex> lk(compaction_mu_);
+  if (shutdown_) return;
+  if (compaction_scheduled_) return;
+
+  int trigger = -1;
+  Version* cur = versions_->current();
+  if (cur != nullptr) {
+    trigger = PickCompactionLevel(cur);
+    cur->Unref();
+  }
+  if (trigger < 0) return;
+
+  compaction_scheduled_ = true;
+  env_->Schedule([this] { BackgroundCompactionTask(); });
+}
+
+void DBImpl::BackgroundCompactionTask() {
+  {
+    std::lock_guard<std::mutex> lk(compaction_mu_);
+    if (shutdown_) {
+      // 投递到析构之间可能已经关库：清占位后立刻返回，别再碰任何成员。
+      compaction_scheduled_ = false;
+      return;
+    }
+    // 登记"我正在跑"。与 shutdown_ 的判定同处一把锁、同一临界区，
+    // 因此不存在"析构以为没人跑、其实任务已开始"的窗口。
+    ++active_compactions_;
+  }
+
+  // 循环压到收敛：一次压缩可能又把下一层顶过阈值，循环才能真正停下来。
+  for (int guard = 0; guard < 64; ++guard) {
+    int trigger = -1;
+    {
+      Version* cur = versions_->current();
+      if (cur != nullptr) {
+        trigger = PickCompactionLevel(cur);
+        cur->Unref();
+      }
+    }
+    if (trigger < 0) break;
+    Status s = CompactLevel(trigger);
+    if (!s.ok()) break;  // 出错就停手，等下次写入再触发
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(compaction_mu_);
+    compaction_scheduled_ = false;
+    // 归零放在最后一步：之后任务不再访问任何 DB 成员，析构等到 0 即为安全点。
+    --active_compactions_;
+  }
+}
+
+void DBImpl::WaitForBackgroundCompaction() {
+  {
+    std::unique_lock<std::mutex> lk(compaction_mu_);
+    shutdown_ = true;
+    // 等到没有任务在跑。这里刻意先释放锁再忙等：任务要拿同一把锁才能把
+    // active_compactions_ 减到 0，持锁等待会直接死锁。
+    //
+    // 不用 condition_variable 的原因：它需要在 ~DBImpl 里销毁，而后台线程
+    // 可能恰好在 notify_all，TSAN 会把这种"逻辑上已唤醒"的并发判为 data race。
+    // 忙等只依赖析构方独占的这把锁，不引入需要额外销毁的同步原语。
+    while (active_compactions_.load(std::memory_order_acquire) > 0) {
+      lk.unlock();
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+      lk.lock();
+    }
+  }
+  // 再投一个屏障任务：Env 的队列是 FIFO，它一旦跑到，就说明排在前面的
+  // compaction 都已执行完毕，此后不会再有任务访问 this。
+  std::promise<void> barrier;
+  env_->Schedule([&barrier] { barrier.set_value(); });
+  barrier.get_future().wait();
+}
+
+// ---------------------------------------------------------------------------
 // 统计与自省：让 Compaction 的效果可被测试直接断言
 // ---------------------------------------------------------------------------
 
@@ -632,25 +722,10 @@ Status DBImpl::Write(const WriteBatch& my_batch) {
       s = CompactMemTable();
     }
 
-    // W6：flush 之后顺手看看要不要压缩。
-    //
-    // 【为什么是循环而不是 if】
-    // 一次 L0->L1 可能把 L1 顶过它的容量上限（本来只差一点点），
-    // 于是还要继续 L1->L2。用循环把这次写请求顺带能完成的压缩都做完，
-    // 避免"写一次、压缩要等下次写"这种不必要的滞后。
-    // guard 只是防御性上限：正常情况下层数有限，几次就收敛了。
+    // W7：flush 之后看看要不要压缩，但只"投个任务"就返回。
+    // 真正的归并在后台线程做，写路径不做 IO，因此不会被压缩拖住。
     if (s.ok()) {
-      for (int guard = 0; guard < 32; ++guard) {
-        int trigger = -1;
-        {
-          Version* cur = versions_->current();
-          trigger = PickCompactionLevel(cur);
-          cur->Unref();
-        }
-        if (trigger < 0) break;
-        s = CompactLevel(trigger);
-        if (!s.ok()) break;
-      }
+      MaybeScheduleCompaction();
     }
   }
 

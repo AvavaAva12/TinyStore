@@ -129,7 +129,13 @@ public:
   // options.snapshot 固定后，多次 Next 之间即使有并发写入，本次扫描的视图也不会
   // 变化——这正是 MVCC 的价值。默认取 kMaxSequenceNumber 表示"读当前最新"。
   //
-  // 【生命周期】返回的迭代器必须在 DB 关闭前销毁（或先 delete DB 再销毁迭代器）。
+  // 【生命周期 —— 这是一条硬约束，违反会 use-after-free】
+  // 返回的迭代器**必须先于 DB 销毁**。迭代器向 VersionSet 借用了 Table 引用，
+  // 析构时负责归还；若 DB 已被 delete，VersionSet 随之释放，归还引用就会访问
+  // 已释放对象。正确写法是用独立作用域把迭代器限制在 DB 存活期内：
+  //     { std::unique_ptr<Iterator> it(db->NewIterator()); /* 用它 */ }
+  //     delete db;
+  // 这与 LevelDB 的约定一致。
   virtual std::unique_ptr<Iterator> NewIterator(
       const ReadOptions& options) const = 0;
 

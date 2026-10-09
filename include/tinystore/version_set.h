@@ -195,7 +195,18 @@ public:
   Status Recover(std::set<uint64_t>* live_files);
 
   // 把一次版本变更落盘到 MANIFEST，并原子安装成新的当前 Version。
-  // 这是 flush 的"提交点"：调用返回后，新文件 + 新 WAL 编号对恢复逻辑可见。
+  // 这是 flush / compaction 的"提交点"：调用返回后，新文件 + 新 WAL 编号
+  // 对恢复逻辑可见。
+  //
+  // 【为什么整段都要持锁】
+  // W4 时代它只在写路径的 leader 里被调用（全库只有一把 mutex_ 保护），
+  // 因此内部无需同步。W6 把 compaction 挪到后台线程后，flush（前台）与
+  // compaction（后台）会并发走到这里：
+  //   * manifest_writer_ 是裸指针，两个线程同时 AddRecord 会写花；
+  //   * "读当前版本 -> 施加 edit -> 交换" 必须是原子的，否则两边的修改会
+  //     互相覆盖 —— 后交换的那个会基于旧版本重建，把先提交的结果整个抹掉。
+  // 所以用独立的 version_edit_mutex_ 把整个 LogAndApply 串行化。
+  // 锁内只有 MANIFEST 追加 + fsync，不含 SSTable 读写，持有时间很短。
   Status LogAndApply(VersionEdit* edit);
 
   // 收集当前 Version 引用的所有 SSTable 编号（供清理孤儿 .ldb 文件）。
@@ -233,6 +244,9 @@ private:
   uint64_t log_number_ = 0;
 
   SequenceNumber last_sequence_ = 0;  // 从 MANIFEST 的 sequence 记录恢复
+
+  // 串行化整个 LogAndApply：flush 与后台 compaction 可能并发提交版本变更。
+  std::mutex version_edit_mutex_;
 
   // 保护 current_ 的"读取 + 取引用"与"换版本 + 释放旧版本"，
   // 使读者不可能拿到一个正被 flush 释放的 Version（详见 current() 的注释）。

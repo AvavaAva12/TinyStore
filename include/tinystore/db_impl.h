@@ -83,6 +83,31 @@ private:
   // 当前的最底层，正是靠它区分这两种情形。
   Status CompactLevel(int level);
 
+  // 若当前有层需要压缩，就往 Env 的后台线程池投一个任务。
+  //
+  // 【为什么 compaction 必须离开写路径】
+  // W6 之前 compaction 是在写路径的 leader 里同步做的，期间整把 mutex_ 被占住，
+  // 意味着**所有写请求都被阻塞**。而归并要做的是大量 SSTable 的读 + 写 +
+  // fsync，属于 IO 密集型操作，耗时可达百毫秒级。把它放在写路径上，等于用
+  // 一次压缩把整个库的写入停顿一下。
+  //
+  // 移到后台后，写路径只做"判断要不要压"（读几个计数器）然后立刻返回；
+  // 真正的 IO 由后台线程承担。压缩期间写入照常进行，新写入可能又触发更多
+  // flush，这正是我们想要的流水线。
+  void MaybeScheduleCompaction();
+
+  // 后台线程实际执行体：反复压缩直到所有层都回到阈值内。
+  void BackgroundCompactionTask();
+
+  // DB 析构前调用：等后台 compaction 彻底退出。
+  //
+  // Env::StartThread/Schedule 出去的任务是 detached 的，DB 析构时无法 join，
+  // 所以必须在这里"投一个屏障任务并等它跑完"。Env 的任务队列是 FIFO，屏障
+  // 一旦执行，之前排队的 compaction 就一定都已经结束——这时才敢释放 DB 对象。
+  // 单靠一个 shutdown_ 标志是不够的：任务可能还没开始跑，标志只是让它提前
+  // 返回，并不保证它没在访问 this。
+  void WaitForBackgroundCompaction();
+
   std::vector<size_t> GetLevelFileCounts() const override;
   std::vector<size_t> GetLevelBytes() const override;
   size_t NumTableFiles() const override;
@@ -122,6 +147,29 @@ private:
 
   // --- 版本 / MANIFEST ---
   VersionSet* versions_ = nullptr;  // 拥有
+
+  // --- 后台 compaction ---
+  //
+  // 【为什么这里没有 condition_variable】
+  // 曾经用 mutex + condvar 等后台任务结束，但 condition_variable 的析构
+  // 本身就是个坑：它在 ~DBImpl 里销毁，而后台线程的 notify_all 可能恰好
+  // 在此刻进行，TSAN 会直接报 data race（即使逻辑上等待者已被唤醒）。
+  // 改用 Env 自带的 FIFO 屏障来等待——Env::Schedule 的队列是先进先出，
+  // 屏障任务一旦跑到，之前投递的 compaction 就一定都已结束，这是更强的
+  // 保证，且不引入需要额外销毁的同步原语。
+  std::mutex compaction_mu_;  // 保护 scheduled_ / shutdown_，并保证投递的原子性
+  bool compaction_scheduled_ = false;
+  bool shutdown_ = false;
+
+  // 正在运行的后台 compaction 数量。
+  //
+  // 只靠 FIFO 屏障不够：屏障只能保证"排在它前面的任务都跑完了"，而任务从
+  // 队列取出到进入 BackgroundCompactionTask 之间存在窗口——屏障可能先于它
+  // 执行。显式登记活跃数量，析构时等到归零才是真正的安全点。
+  //
+  // 增减都在 compaction_mu_ 保护下完成，与 shutdown_ 的判定处于同一临界区，
+  // 因此不会出现"析构以为没人跑、任务却刚开始"的空档。
+  std::atomic<int> active_compactions_{0};
 };
 
 }  // namespace tinystore
