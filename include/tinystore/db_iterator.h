@@ -426,11 +426,21 @@ private:
 // 它会被 delete，迭代器就访问了悬垂内存。因此适配器构造时 Ref、析构时 Unref，
 // 把"迭代期间 MemTable 必须存活"这个约束落到代码里，而不是靠调用方记得。
 // ===========================================================================
+// 把 MemTable 包成一个 Iterator 源，供 DBIterator 归并。
+//
+// 【引用语义：接管而非新增】
+// 调用方必须**已经持有一个引用**，并在构造期间保证 mem 存活（通常是在
+// mem_mutex_ 临界区内完成 "load + Ref"）。本类在析构时归还这一个引用 ——
+// 它是整个迭代器存活期间该 MemTable 不被 flush 释放的唯一保证。
+//
+// 【为什么不在构造函数里 Ref】
+// DBImpl::NewIterator 必须在 mem_mutex_ 临界区内完成 "load + Ref"，才能避免
+// "load 到 m 之后、Ref 之前"被 flush 换表并 delete（use-after-free）。若本类
+// 构造时再 Ref 一次，就变成两次 Ref、只有一次 Unref，永久泄漏一个引用 ——
+// 这个错误很隐蔽，因为功能测试全绿，只有 LeakSanitizer 能发现。
 class MemTableIteratorAdapter : public Iterator {
 public:
-  explicit MemTableIteratorAdapter(MemTable* mem) : mem_(mem), iter_(mem) {
-    mem_->Ref();
-  }
+  explicit MemTableIteratorAdapter(MemTable* mem) : mem_(mem), iter_(mem) {}
   ~MemTableIteratorAdapter() override {
     if (mem_ != nullptr) mem_->Unref();
   }

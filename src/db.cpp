@@ -116,8 +116,44 @@ DBImpl::~DBImpl() {
 Status DB::Open(const Options& options, const std::string& name, DB** dbptr) {
   *dbptr = nullptr;
 
-  if (options.error_if_exists && options.env->FileExists(name)) {
-    return Status::InvalidArgument(name, "exists");
+  // ---- 配置校验：把非法配置挡在入口 ----
+  //
+  // 【为什么不交给各个使用点自己防御】
+  // 这些值一旦非法，错误会在离配置点很远的地方以另一种面貌爆出来：比如
+  // max_level_bytes_multiplier=0 会让 LevelCapacity 里的 `UINT64_MAX / 0`
+  // 在任意一次压缩选层时触发整数除零（UB），而症状是"某次压缩莫名崩溃"，
+  // 排查时根本想不到与配置有关。集中校验让问题在 Open 时就暴露。
+  if (options.max_level_bytes_multiplier == 0) {
+    return Status::InvalidArgument("Options.max_level_bytes_multiplier",
+                                   "must be >= 1 (0 would cause divide by zero)");
+  }
+  if (options.max_num_levels < 2) {
+    return Status::InvalidArgument("Options.max_num_levels",
+                                   "must be >= 2 (need at least L0 and L1)");
+  }
+  if (options.write_buffer_size == 0) {
+    return Status::InvalidArgument("Options.write_buffer_size", "must be > 0");
+  }
+  if (options.l0_compaction_trigger == 0) {
+    return Status::InvalidArgument("Options.l0_compaction_trigger",
+                                   "must be > 0 (0 would compact on every flush)");
+  }
+
+  // ---- 目录存在性：create_if_missing / error_if_exists 的组合语义 ----
+  //
+  // 【此前 create_if_missing 从未被读取】
+  // 实现里无条件调用 CreateDirIfMissing，导致用默认 Options{}（该项为 false）
+  // 打开一个不存在的库会**静默创建**，与选项语义完全相反 —— 用户以为会拿到
+  // NotFound，实际拿到一个空库。若他随后往里写数据，就覆盖了一个本该被拒绝的
+  // 场景（例如路径写错，误在别处建了库）。
+  const bool dir_exists = options.env->FileExists(name);
+  if (!dir_exists) {
+    if (!options.create_if_missing) {
+      return Status::InvalidArgument(
+          name, "does not exist (Options.create_if_missing is false)");
+    }
+  } else if (options.error_if_exists) {
+    return Status::InvalidArgument(name, "exists (Options.error_if_exists is true)");
   }
 
   DBImpl* impl = new DBImpl(options, name);
@@ -212,9 +248,22 @@ Status DBImpl::Recover() {
       const SequenceNumber first = WriteBatchInternal::Sequence(&batch);
       const uint32_t n = batch.Count();
       if (n > 0) {
-        WriteBatchInternal::InsertInto(&batch, m);
+        // 损坏记录一条都插不进去，此时**不能**推进 max_seq，否则快照点会被推到
+        // 一个从未写入的区间（sequence 空洞），这批数据也静默丢失。
+        s = WriteBatchInternal::InsertInto(&batch, m);
+        if (!s.ok()) break;
         max_seq = std::max(max_seq, first + n - 1);
       }
+    }
+    if (!s.ok()) {
+      m->Unref();
+      return s;
+    }
+    // 区分"读完"与"损坏"：WAL 中段损坏必须硬失败，不能当成正常读完继续开库。
+    // 尾部残缺（写到一半崩溃）由 Reader 归为正常 EOF，status() 为 OK，可安全继续。
+    if (!reader.status().ok()) {
+      m->Unref();
+      return reader.status();
     }
     // 与 MANIFEST 里的 sequence 取较大值：flush 后的数据不在本 WAL 中，
     // 只靠重放 WAL 会拿回一个偏小（甚至为 0）的快照点。
@@ -491,50 +540,73 @@ static bool RangesOverlap(const InternalKeyComparator* icmp,
 }
 
 Status DBImpl::CompactLevel(int level) {
+  // 【拒绝压缩最后一层】
+  // PickCompactionLevel 的循环范围是 [0, max_num_levels)，所以 level 最大可以是
+  // max_num_levels-1，压缩后输出会落到第 max_num_levels 层。而该层永远不会被
+  // PickCompactionLevel 选中（循环不覆盖它），这批文件就永久不再参与压缩，
+  // 读放大持续上升。实测需要 8TB 数据才触发，属理论缺陷，但边界必须守住。
+  if (level < 0 || level + 1 >= options_.max_num_levels) {
+    return Status::InvalidArgument("CompactLevel", "level out of range");
+  }
+
   const int next_level = level + 1;
   const bool next_is_final = (next_level >= options_.max_num_levels - 1);
 
   // 1) 选源文件。L0 整体参与；更高层只挑一个文件（挑最小的那个最划算，
   //    因为它归并后能最快沉到下一层）。
-  std::vector<const FileMetaData*> inputs;
+  //
+  // 【为什么按值拷贝而不是存 const FileMetaData*】
+  // VersionSet 换版本时 old->Unref() 会在归零时 delete 旧 Version。若这里存
+  // 元素的裸指针，Unref() 之后 VersionSet::current() 返回的裸指针，以及下面
+  // min_element / input_numbers / RangesOverlap 的每一次解引用，都可能读到
+  // 已释放内存。W7 把 compaction 挪到后台后，flush（写路径线程）与 compaction
+  // （后台线程）会并发 LogAndApply，**这个窗口从边缘场景变成了常态**。
+  //
+  // FileMetaData 只含 3 个 string + 2 个数字，拷贝成本远低于一次 compaction
+  // 的 IO，用内存换正确性是划算的。
+  std::vector<FileMetaData> inputs;
   {
     Version* v = versions_->current();
+    if (v == nullptr) return Status::OK();
     if (v->files().empty()) {
       v->Unref();
       return Status::OK();
     }
-    for (const auto* f : v->FilesAtLevel(level)) inputs.push_back(f);
+    for (const FileMetaData* f : v->FilesAtLevel(level)) inputs.push_back(*f);
     v->Unref();
   }
   if (inputs.empty()) return Status::OK();
   if (level > 0 && inputs.size() > 1) {
-    const FileMetaData* smallest =
+    // 先拷进局部变量再 assign：min_element 返回的是 inputs 内元素的引用，
+    // 边赋值边读同一个 vector 会踩迭代器失效。
+    const FileMetaData smallest =
         *std::min_element(inputs.begin(), inputs.end(),
-                          [](const FileMetaData* a, const FileMetaData* b) {
-                            return a->number < b->number;
+                          [](const FileMetaData& a, const FileMetaData& b) {
+                            return a.number < b.number;
                           });
     inputs.assign(1, smallest);
   }
 
   // 2) 选下一层中与源文件范围重叠的文件。这些文件要被源文件的新版本覆盖，
   //    所以必须一起参与归并，否则旧版本会"复活"。
+  //
+  // 只需记录编号：归并阶段按 input_numbers 逐个 AcquireTable（见下文第 3 步），
+  // 不需要再持有 FileMetaData 本身。
   std::vector<uint64_t> input_numbers;
-  std::vector<const FileMetaData*> inputs_next;
   {
     Version* v = versions_->current();
-    for (const auto* f : inputs) input_numbers.push_back(f->number);
-    for (const auto* g : v->FilesAtLevel(next_level)) {
+    if (v == nullptr) return Status::OK();
+    for (const FileMetaData& f : inputs) input_numbers.push_back(f.number);
+    for (const FileMetaData* gp : v->FilesAtLevel(next_level)) {
+      const FileMetaData& g = *gp;
       bool overlaps = false;
-      for (const auto* f : inputs) {
-        if (RangesOverlap(&icmp_, *f, *g)) {
+      for (const FileMetaData& f : inputs) {
+        if (RangesOverlap(&icmp_, f, g)) {
           overlaps = true;
           break;
         }
       }
-      if (overlaps) {
-        inputs_next.push_back(g);
-        input_numbers.push_back(g->number);
-      }
+      if (overlaps) input_numbers.push_back(g.number);
     }
     v->Unref();
   }
@@ -845,6 +917,7 @@ Status DBImpl::Write(const WriteBatch& my_batch) {
 
   if (s.ok()) {
     MemTable* m = mem_.load(std::memory_order_acquire);
+    // 自己刚构造的 batch 不可能损坏，这里 OK 即忽略；WAL 重放路径才必须检查
     WriteBatchInternal::InsertInto(&combined, m);
     // 先回放内存，再 release 发布新的 last_sequence_
     last_sequence_.store(seq + combined.Count() - 1, std::memory_order_release);
@@ -973,6 +1046,13 @@ Status DBImpl::Get(const Slice& key, std::string* value,
   // 未命中：后续只查 SSTable，不再需要 MemTable 的引用，提前释放。
   m->Unref();
 
+  // 【与下面 SSTable 侧同一原则】非 NotFound 的错误必须上报，不能继续扫。
+  // MemTable::Get 在无法解析 internal key 时返回 Corruption 且 found 保持 false，
+  // 若在此静默丢弃，内存损坏就被伪装成"key 不存在"，与整条读路径的既定原则矛盾。
+  if (!s.ok() && !s.IsNotFound()) {
+    return s;
+  }
+
   // 2) SSTable：从新到旧扫描；每个文件的 bloom 过滤器可整体跳过"一定不含"的文件
   Version* v = versions_->current();
   if (v == nullptr) {
@@ -1030,10 +1110,17 @@ std::unique_ptr<Iterator> DBImpl::NewIterator(const ReadOptions& options) const 
 
   // MemTable 作为第一个数据源。适配器在构造时 Ref、析构时 Unref，所以即使
   // 迭代途中发生 flush 把这个 MemTable 换出去，它也一定存活到迭代器销毁。
+  //
+  // 【为什么必须在锁内完成 Ref，而不能靠适配器构造时 Ref】
+  // mem_ 恒有 DB 持有的所有权引用，所以"临界区内 load 到的表必然存活"——
+  // 但这个保证只在**锁内**成立。锁一放，flush 就可能 store(new_mem) 并 Unref
+  // 掉旧表；若旧表引用归零即被 delete，随后适配器构造函数对已释放内存调 Ref，
+  // 就是 use-after-free。与 Get 的做法保持一致，不给两条读路径留差异。
   MemTable* m = nullptr;
   {
     std::lock_guard<std::mutex> lk(mem_mutex_);
     m = mem_.load(std::memory_order_relaxed);
+    if (m != nullptr) m->Ref();
   }
   if (m != nullptr) {
     it->AddChild(std::make_unique<MemTableIteratorAdapter>(m));

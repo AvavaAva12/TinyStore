@@ -235,6 +235,14 @@ Status VersionSet::Recover(std::set<uint64_t>* live_files) {
       last_sequence_ = std::max(last_sequence_, edit.sequence);
     }
   }
+  // 【必须区分"读完"与"损坏"】
+  // ReadRecord 返回 false 时可能是正常读到文件尾，也可能是 MANIFEST 中段损坏。
+  // 若不查 status() 就当成正常结束，log_number 与 live_files 会停留在损坏点
+  // 之前的值，随后 DBImpl 的孤儿清理会把本该有效的新 WAL 与已登记的 SSTable
+  // 双向删除 —— 丢数据且没有任何错误返回。这条路径必须硬失败。
+  if (!reader.status().ok()) {
+    return reader.status();
+  }
   log_number_ = has_log ? log_num : 0;
 
   // 文件编号计数器要跳过所有已存在编号（SSTable + 当前 WAL），

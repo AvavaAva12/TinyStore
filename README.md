@@ -102,19 +102,18 @@ TinyStore/
 
 ## 已知限制
 
-**这些是已确认存在的缺陷，不是待办清单。** 完整分析、证伪记录与修复优先级见 [`docs/code-review.md`](docs/code-review.md)。
+第一轮代码审查发现的 15 项缺陷中，优先级 1~5 的部分**已全部修复**并补了回归测试。剩余项按"不做的后果"排序，完整分析见 [`docs/code-review.md`](docs/code-review.md)。
 
-最需要留意的三条：
-
-| 问题 | 后果 |
+| 限制 | 后果 |
 |---|---|
-| `CompactLevel` 选源文件时留下 `FileMetaData*` 悬垂指针 | 并发 flush/compaction 时 use-after-free，可能选错输入文件并丢数据 |
-| `NewIterator` 的 MemTable 引用在锁外建立 | 与并发 flush 交叠时 use-after-free（同文件的 `Get` 写法是对的，两条路径不一致） |
-| `log::Reader` 无法区分"读完"与"损坏" | MANIFEST **中段**损坏会让 `log_number` 回退，新 WAL 与已登记的 SSTable 被双向删除 → 丢数据且**全程无报错** |
+| WAL 滚动与 compaction 输出均未检查 `Close()` | 输出文件 `Close` 失败会被忽略，可能把不完整文件登记进 MANIFEST |
+| MANIFEST 只追加不压缩 | 重放时间随运行时长线性上升 |
+| L1→L2 整层参与 compaction | 层大时写放大偏高（纯性能，非正确性） |
+| 13 处 `DeleteFile` 未检查返回值 | unlink 失败导致孤儿文件堆积（下次启动会清理） |
 
-前两条都发生在 W7 把 compaction 挪到后台之后才成为常态（此前写路径单线程，窗口极窄）。它们长期未被发现的原因是**测试盲区**：迭代测试与并发测试分开跑，没有交叉覆盖。
+**已修复的高危项**（均有回归测试）：`CompactLevel` 悬垂指针、`NewIterator` 引用建立太晚、`log::Reader` 无法区分损坏与 EOF、`Block` 重启点数组无下界校验、`metaindex` 损坏被吞成 OK、层号 off-by-one、`create_if_missing` 未实现、`max_level_bytes_multiplier=0` 整数除零、`Get` 丢弃 MemTable Corruption、`InsertInto` 忽略 `Iterate` 失败。
 
-其余：`Block` 重启点数组无下界校验、metaindex 损坏被吞成"打开成功"、`max_level_bytes_multiplier=0` 整数除零、`create_if_missing` 选项未实现、`Close()` 返回值未检查、13 处 `DeleteFile` 未检查返回值，以及一批死代码与失真注释。
+修复过程中还暴露一个值得记录的陷阱：把 `Ref()` 移进锁内以修 UAF 时，若适配器构造时**也** `Ref()`，就变成两次 Ref、一次 Unref，功能测试全绿但永久泄漏一个引用——只有 LeakSanitizer 在进程退出时才看得见。见 [`docs/code-review.md`](docs/code-review.md) 的"修复过程中发现的新问题"。
 
 ---
 

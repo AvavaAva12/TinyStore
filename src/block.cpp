@@ -81,14 +81,32 @@ size_t BlockBuilder::CurrentSizeEstimate() const {
 
 Block::Block(const Slice& contents)
     : data_(contents.data()), size_(contents.size()), num_restarts_(0),
-      restarts_ptr_(contents.data()) {
-  if (size_ >= kBlockTrailerSize + 4) {
-    num_restarts_ =
-        DecodeFixed32(data_ + size_ - 4);
-    restarts_ptr_ = data_ + size_ - 4 -
-                    4 * static_cast<size_t>(num_restarts_);
-    entries_end_ = static_cast<uint32_t>(restarts_ptr_ - data_);
+      restarts_ptr_(contents.data()), entries_end_(0) {
+  if (size_ < kBlockTrailerSize + 4) return;
+
+  const uint32_t num = DecodeFixed32(data_ + size_ - 4);
+  // 【重启点数组必须落在块内】
+  // contents 已由 ReadBlock 剥掉 5 字节 trailer，末尾 4 字节是重启点数量，
+  // 再往前 num*4 字节是重启点偏移数组。若这个数组声明的长度超出块的实际大小，
+  // 说明块内容已损坏（重启点数量是垃圾值）。此时若照单全收：
+  //   * restarts_ptr_ 会指到 data_ **之前**；
+  //   * entries_end_ = restarts_ptr_ - data_ 为负，转 uint32_t 后回绕成巨大值；
+  // 于是 ParseEntry / RestartIndexFor 里以 entries_end_ 为界的检查全部失效，
+  // 按损坏数据里的偏移做指针运算即为堆越界读。
+  //
+  // 代价只是一次比较，收益是把"损坏数据"从 UB 降级为"该块不可迭代"。
+  // CRC 校验（ReadBlock）能挡住绝大多数损坏，但 4 字节 CRC 存在 1/2^32 的
+  // 碰撞概率，且未来的压缩/加密等改动都可能改变损坏的形态——这道后防线值得留。
+  if (num == 0 || 4u * static_cast<uint64_t>(num) + 4 > size_) {
+    num_restarts_ = 0;
+    restarts_ptr_ = contents.data();
+    entries_end_ = 0;
+    return;
   }
+
+  num_restarts_ = num;
+  restarts_ptr_ = data_ + size_ - 4 - 4 * static_cast<size_t>(num_restarts_);
+  entries_end_ = static_cast<uint32_t>(restarts_ptr_ - data_);
 }
 
 Status Block::Get(const Comparator* cmp, const Slice& lookup,

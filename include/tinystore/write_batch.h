@@ -83,7 +83,15 @@ struct WriteBatchInternal {
   // 把 batch 里的所有记录回放到 memtable：
   // 从 batch 的起始 sequence 开始，逐条自增分配 sequence 后写入 MemTable。
   // 回放完把 batch 自身的 sequence 推进到最后一条之后，方便下一个 batch 续接。
-  static void InsertInto(const WriteBatch* batch, MemTable* memtable);
+  // 把 batch 的每条 record 逐条灌入 memtable。
+  //
+  // 【返回 Status 是必需的，不是可选的严谨】
+  // batch 内容损坏时 Iterate 会返回 Corruption 且**一条都没插入**。调用方若忽略
+  // 本返回值，仍会按头部 count 推进 sequence，于是 last_sequence_ 被推到从未写入
+  // 的区间（sequence 空洞），同时这批数据静默丢失。两个调用点都必须检查：
+  //   * WAL 重放（db.cpp）—— 遇到损坏记录应停止重放且不推进快照点
+  //   * 写路径（db.cpp Write）—— 自己刚构造的 batch 不可能损坏，OK 即忽略
+  static Status InsertInto(const WriteBatch* batch, MemTable* memtable);
 
   // 把 src 的所有 record 追加到 dst（用于 W3 的 Group Commit 合并多个写）
   static void Append(WriteBatch* dst, const WriteBatch* src);

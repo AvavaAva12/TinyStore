@@ -88,8 +88,8 @@ void WriteBatchInternal::SetSequence(WriteBatch* batch, SequenceNumber seq) {
   EncodeFixed64(batch->rep_.data(), seq);
 }
 
-void WriteBatchInternal::InsertInto(const WriteBatch* batch,
-                                    MemTable* memtable) {
+Status WriteBatchInternal::InsertInto(const WriteBatch* batch,
+                                     MemTable* memtable) {
   class Inserter : public WriteBatch::Handler {
   public:
     SequenceNumber seq = 0;
@@ -105,9 +105,15 @@ void WriteBatchInternal::InsertInto(const WriteBatch* batch,
   } ins;
   ins.seq = Sequence(batch);
   ins.mem = memtable;
-  batch->Iterate(&ins);
+  // 【必须检查 Iterate 的返回值】
+  // Iterate 遇到非法格式返回 Corruption，此时一条都没插入。若忽略它继续推进
+  // sequence，调用方（WAL 重放）会按头部 count 把 last_sequence_ 推到
+  // 一个从未真正写入的区间 —— 产生 sequence 空洞，且这批数据静默丢失。
+  Status s = batch->Iterate(&ins);
+  if (!s.ok()) return s;
   // 把 batch 的起始 sequence 推进到最后一条之后，方便下一个 batch 续接
   SetSequence(const_cast<WriteBatch*>(batch), ins.seq);
+  return Status::OK();
 }
 
 void WriteBatchInternal::Append(WriteBatch* dst, const WriteBatch* src) {

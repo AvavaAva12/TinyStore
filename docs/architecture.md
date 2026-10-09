@@ -247,17 +247,18 @@ W1~W3 见 `design-notes.md`。以下记录后续阶段中**容易被后来者推
 
 ## 七、已知限制
 
-以下均为**已确认存在**的缺陷，按"不做的后果"排序。完整分析见 [`code-review.md`](code-review.md)。
+以下均为**已确认存在**的缺陷。优先级 1~5 的条目已在审查后修复，剩余项按"不做的后果"排序。完整分析见 [`code-review.md`](code-review.md)。
 
 | 限制 | 后果 |
 |---|---|
-| `CompactLevel` 选源文件时留下 `FileMetaData*` 悬垂指针 | 并发 flush/compaction 时 UAF，可能选错输入文件并丢数据 |
-| `NewIterator` 的 MemTable 引用在锁外建立 | 与并发 flush 交叠时 UAF |
-| `log::Reader` 无法区分"读完"与"损坏" | MANIFEST **中段**损坏会导致 `log_number` 回退，新 WAL 与已登记的 SSTable 被双向删除 → 丢数据且无报错 |
-| `Block` 构造对重启点数组无下界校验 | 损坏数据下边界检查失效 → 堆越界读（需 CRC 恰好碰撞，概率 1/2³²） |
-| 迭代测试与并发测试分开，无交叉覆盖 | 上面两条 UAF 长期未被发现的原因 |
+| WAL 滚动与 compaction 输出均未检查 `Close()` | 输出文件 `Close` 失败会被忽略，可能把不完整文件登记进 MANIFEST |
 | MANIFEST 只追加不压缩 | 重放时间随运行时长线性上升 |
 | L1→L2 整层参与 compaction | 层大时写放大偏高（纯性能，非正确性） |
-| 无 WAL 半条记录（尾部截断）的测试 | W9 覆盖了"进程被杀"，未覆盖"记录写到一半" |
+| 13 处 `DeleteFile` 未检查返回值 | unlink 失败导致孤儿文件堆积（下次启动会清理） |
+| 严格警告 36 处（`-Wsign-conversion` 为主） | 目前都不是 bug，但属该清理的欠账 |
+
+**已修复**（曾是高危，现已有回归测试覆盖）：`CompactLevel` 悬垂指针、`NewIterator` 引用建立太晚、`log::Reader` 无法区分损坏与 EOF、`Block` 重启点数组无下界校验、`metaindex` 损坏被吞成 OK、层号 off-by-one、`create_if_missing` 未实现、`max_level_bytes_multiplier=0` 整数除零、`Get` 丢弃 MemTable Corruption、`InsertInto` 忽略 `Iterate` 失败。
 
 **架构层面的已知空白**（尚未实现，不算缺陷）：无网络文件系统适配；无块缓存（每次点查都重读索引块）；`Logger` 接口存在但未接入；无指标导出。
+
+**测试盲区**（已部分补上）：`IteratorSurvivesConcurrentFlushAndCompaction` 打开了"迭代器存活期间并发 flush/compaction"的交叉窗口，两处 UAF 正是因此长期未被发现。同类盲区仍存在于"WAL 记录写到一半"（尾部截断）——W9 覆盖了"进程被杀"，未覆盖"记录写到一半"。

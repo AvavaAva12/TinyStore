@@ -4,7 +4,53 @@
 >
 > 方法：编译器严格警告（36 处）+ 全量人工走查。每条结论交付前都构造了反例尝试推翻（证伪门禁），未能推翻的才保留。
 >
-> **本报告只做诊断，不含修复。** 修复需另行确认后进行。
+> **修复状态：优先级 1~5 的条目已全部修复并通过三配置验证**，见下方状态表。剩余项见文末。
+
+## 修复状态
+
+| 编号 | 问题 | 状态 |
+|---|---|---|
+| **S1** | `CompactLevel` 选源文件留下悬垂指针 | ✅ 已修（改为按值持有 `FileMetaData`，并删除只写不读的 `inputs_next`） |
+| **S2** | `NewIterator` 的 MemTable 引用在锁外建立 | ✅ 已修（锁内 load + Ref；连带修正适配器的引用语义，见下方"修复过程中发现的问题"） |
+| **S3** | `log::Reader` 无法区分"读完"与"损坏" | ✅ 已修（三态返回 + `status()`，两个调用点均检查） |
+| **W4** | `Get` 丢弃 MemTable 的 Corruption | ✅ 已修 |
+| **W5** | `InsertInto` 忽略 `Iterate` 返回值 | ✅ 已修（`InsertInto` 改返回 `Status`，WAL 重放检查） |
+| **W3** | `max_level_bytes_multiplier=0` 整数除零 | ✅ 已修（`Open` 入口统一校验配置） |
+| **W6** | `create_if_missing` 从未实现 | ✅ 已修 |
+| **W1** | `Block` 重启点数组无下界校验 | ✅ 已修 |
+| **W2** | `metaindex` 损坏被吞成"打开成功" | ✅ 已修 |
+| **W7** | 层号 off-by-one（第 8 层永不压缩） | ✅ 已修（`CompactLevel` 入口拒绝越界 level） |
+| W8 | WAL / compaction 输出未检查 `Close()` | ⏳ 未修（下一批） |
+| W9 | 13 处 `DeleteFile` 未检查返回值 | ⏳ 未修（风险最低） |
+| S-A | 死代码 6 处 | ✅ 部分清理（`inputs_next`、`restart_index_` 随修复顺带处理） |
+| S-B | 注释与代码不一致 4 处 | ⏳ 未修（随下批一并处理） |
+| S-C | 严格警告 36 处 | ⏳ 未修 |
+
+## 修复过程中发现的新问题（重要）
+
+修 S2 时暴露出一个**连 ASAN 普通用法都抓不到的引用计数错误**，值得单独记录：
+
+改完"锁内 load + Ref"后，LeakSanitizer 报出 56 处泄漏，追下来是：`NewIterator` 里 `Ref()` 一次，而 `MemTableIteratorAdapter` 的构造函数**又** `Ref()` 一次，析构只 `Unref()` 一次 —— **两次 Ref、一次 Unref**，永久泄漏一个引用。
+
+这个错误的隐蔽性在于：功能测试全绿（数据完全正确），只有 LeakSanitizer 在进程退出时才发现。而它是我**为了修一个 UAF 而引入的** —— 如果只跑功能测试就提交，会把一个内存破坏 bug 换成一个内存泄漏 bug。
+
+修复方式：把适配器的语义从"构造时新增引用"改为"**接管调用方的引用**"，并在类注释里写明这个约定。当前只有 `NewIterator` 一处构造，无其他调用者。
+
+## 验证
+
+- 三配置：none / ASAN 各 17/17，TSAN 16/16（`crash_test` 按设计排除）
+- 变异验证：
+  - 去掉 S3 的状态检查 → `CorruptedManifestMiddleIsRejected` 失败 ✓
+  - 把 S2 的 `Ref()` 移回锁外并放大窗口 → ASAN 报 `heap-use-after-free` ✓
+- 新增 5 个回归用例（迭代器并发、MANIFEST 中段损坏、`create_if_missing`、`error_if_exists`、配置校验）
+
+### 关于 MANIFEST 损坏测试的一个观察
+
+`CorruptedManifestMiddleIsRejected` 在去掉状态检查后**仍然失败**了，但错误是 `IO error: current log file missing` 而非 `Corruption`。这说明该场景下 `log_number` 回退到了某个**已被删除**的 WAL 次生报错，才让 `Open` 没能成功。
+
+**危险正在于此**：只要损坏点之后回退到的 `log_number` 恰好指向一个**仍然存在**的 WAL（例如只回退了一两条记录），`Open` 就会成功，而新 WAL 与已登记的 SSTable 已被双向删除 —— 数据消失且无任何报错。也就是说这个缺陷**看起来"有其他保护兜着"**，实际上那只是巧合。任何据此认为"影响有限"的判断都是错的。
+
+---
 
 ## 摘要
 

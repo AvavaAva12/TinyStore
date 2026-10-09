@@ -1,6 +1,8 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1284,6 +1286,217 @@ TEST(DBTest, ThrottlingNeverStarvesCompaction) {
   }
 
   delete db;
+  RemoveAll(name);
+}
+
+// ===========================================================================
+// 审查发现的缺陷回归测试
+//
+// 这些用例不是为了"让实现显得被测过"，而是审查报告里点名的两处 UAF 与一处
+// 静默损坏**长期未被发现的根因**：迭代测试与并发测试分开跑，没有交叉覆盖。
+// ===========================================================================
+
+// 迭代器存活期间，另一线程持续写入触发 flush + compaction。
+//
+// 【这条用例专门覆盖两处 use-after-free 的触发条件】
+//   * CompactLevel 把 Version 里 FileMetaData 元素的裸指针存进 vector 后就 Unref，
+//     随后并发 LogAndApply（后台 compaction 与写路径 flush 都会换版本）会让旧
+//     Version 被 delete —— 后续解引用即 UAF。
+//   * NewIterator 若只在锁内 load 而把 Ref 放到锁外，flush 换表时旧 MemTable 可能
+//     被 delete，适配器随后对它 Ref 即 UAF。
+//
+// 两者都不会被 ASAN/TSAN 在"迭代测试"或"并发测试"里抓到，因为缺少这个交叉。
+// 本例不试图断言某个具体竞态一定发生，而是把并发窗口开到足够宽：任何一次
+// UAF 都会让 ASAN 直接失败，这是"验证会发生什么"而非"验证不发生什么"。
+TEST(DBTest, IteratorSurvivesConcurrentFlushAndCompaction) {
+  Options opt;
+  opt.create_if_missing = true;
+  opt.write_buffer_size = 1024;      // 频繁 flush
+  opt.l0_compaction_trigger = 2;    // 频繁 compaction
+  opt.max_level_bytes = 4096;       // 更容易触达多层，制造换版本
+  opt.max_level_bytes_multiplier = 2;
+  const std::string name = TempDbName("iter_concurrent");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  // 基线数据，保证迭代器拿到的是一个非空快照
+  const int kBase = 300;
+  for (int i = 0; i < kBase; ++i) {
+    ASSERT_TRUE(db->Put("key" + std::string(4, '0') + std::to_string(i),
+                        "base" + std::to_string(i)).ok());
+  }
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> written{0};
+  std::thread writer([&] {
+    int i = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      if (db->Put("new" + std::to_string(i),
+                  "payload" + std::string(64, 'y')).ok()) {
+        written.fetch_add(1, std::memory_order_relaxed);
+      }
+      ++i;
+    }
+  });
+
+  // 反复遍历：每次 SeekToFirst 都要求 VersionSet / MemTable 重新定位，
+  // 正好穿过 load 与 Ref 之间、Unref 与解引用之间的那些窗口。
+  int last_seen = 0;
+  for (int round = 0; round < 60 && written.load(std::memory_order_relaxed) < 200;
+       ++round) {
+    std::unique_ptr<Iterator> it(db->NewIterator(ReadOptions()));
+    it->SeekToFirst();
+    int seen = 0;
+    while (it->Valid()) {
+      ++seen;
+      it->Next();
+    }
+    ASSERT_TRUE(it->status().ok())
+        << "并发写入期间迭代器状态异常（round=" << round << "）";
+    // 迭代器是快照读：至少应看到创建时的全部基线数据（并发写入的看不到）
+    EXPECT_GE(seen, kBase) << "迭代器丢了基线数据（round=" << round << "）";
+    last_seen = seen;
+  }
+
+  stop.store(true, std::memory_order_relaxed);
+  writer.join();
+  EXPECT_GT(written.load(std::memory_order_relaxed), 0) << "并发写入线程未跑起来";
+  EXPECT_GT(last_seen, 0);
+
+  delete db;
+  RemoveAll(name);
+}
+
+// MANIFEST **中段**损坏必须让 Open 失败，绝不能被当成"正常读完"。
+//
+// 【这条用例验证的是"绝不静默丢数据"原则的最后一道防线】
+// 若损坏被静默接受，重放会提前终止并被判为成功，于是：
+//   log_number 退回到损坏点之前的值 → 指向新 WAL 的记录被丢弃
+//   → 恢复逻辑把那个新 WAL 当孤儿删除；同时本次 flush 已登记的 SSTable 也成孤儿
+//   → 数据在两个方向上同时消失，全程没有任何错误返回。
+//
+// 尾部截断是**另一回事**（写到一半崩溃，fsync 边界，正常丢弃即可），
+// 由 Reader 归为正常 EOF。这条用例只针对中段损坏。
+TEST(DBTest, CorruptedManifestMiddleIsRejected) {
+  Options opt;
+  opt.create_if_missing = true;
+  opt.write_buffer_size = 512;    // 多次 flush => MANIFEST 里有多条记录
+  const std::string name = TempDbName("manifest_corrupt");
+  RemoveAll(name);
+
+  {
+    DB* db = nullptr;
+    ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+    for (int i = 0; i < 200; ++i) {
+      ASSERT_TRUE(db->Put("key" + std::to_string(i), "v" + std::to_string(i)).ok());
+    }
+    delete db;  // 正常关闭，确保 MANIFEST 有足够多的记录
+  }
+
+  const std::string manifest = name + "/MANIFEST";
+  uint64_t fsize = 0;
+  ASSERT_TRUE(Env::Default()->GetFileSize(manifest, &fsize).ok());
+  ASSERT_GT(fsize, 100u) << "MANIFEST 过小，无法构造中段损坏";
+
+  {
+    // 从文件中部开始翻转 64 个字节。MANIFEST 的记录是连续排列的（只有块边界
+    // 才有填充），这个长度必然命中至少一条记录的 header 或 payload，
+    // 使其 CRC 校验失败 —— 这正是"中段损坏"的形态。
+    std::fstream f(manifest, std::ios::in | std::ios::out | std::ios::binary);
+    ASSERT_TRUE(f.is_open()) << "无法以读写方式打开 MANIFEST";
+    f.seekg(static_cast<std::streamoff>(fsize / 2));
+    for (int i = 0; i < 64; ++i) {
+      const std::streampos pos = f.tellg();
+      if (pos < 0) break;
+      f.seekg(pos);
+      char c = 0;
+      f.read(&c, 1);
+      if (!f) break;
+      const char flipped = static_cast<char>(c ^ 0xFF);
+      f.seekp(pos);
+      f.write(&flipped, 1);
+    }
+    f.flush();
+  }
+
+  DB* db = nullptr;
+  const Status s = DB::Open(opt, name, &db);
+  EXPECT_FALSE(s.ok()) << "MANIFEST 中段损坏必须让 Open 失败，而不是静默接受";
+  EXPECT_TRUE(s.IsCorruption()) << "应报告为 Corruption，实际：" << s.ToString();
+  EXPECT_EQ(db, nullptr);
+  RemoveAll(name);
+}
+
+// create_if_missing 的默认语义此前从未被实现：默认 Options{} 打开不存在的库
+// 会静默创建，与选项含义完全相反。
+TEST(DBTest, CreateIfMissingFalseRejectsMissingDirectory) {
+  Options opt;  // create_if_missing 默认 false
+  const std::string name = TempDbName("no_create");
+  RemoveAll(name);
+
+  DB* db = nullptr;
+  const Status s = DB::Open(opt, name, &db);
+  EXPECT_TRUE(s.IsInvalidArgument())
+      << "默认配置下打开不存在的库应报错，实际：" << s.ToString();
+  EXPECT_EQ(db, nullptr);
+  RemoveAll(name);
+}
+
+TEST(DBTest, ErrorIfExistsRejectsExistingDirectory) {
+  Options opt;
+  opt.create_if_missing = true;
+  const std::string name = TempDbName("exists");
+  RemoveAll(name);
+
+  DB* db = nullptr;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+  ASSERT_TRUE(db->Put("k", "v").ok());
+  delete db;
+
+  Options opt2;
+  opt2.create_if_missing = true;
+  opt2.error_if_exists = true;
+  DB* db2 = nullptr;
+  const Status s = DB::Open(opt2, name, &db2);
+  EXPECT_TRUE(s.IsInvalidArgument()) << "error_if_exists 应拒绝已存在的目录";
+  EXPECT_EQ(db2, nullptr);
+  RemoveAll(name);
+}
+
+// 非法配置必须在 Open 时就被挡下，而不是留到某次压缩时以整数除零的形式爆出来。
+TEST(DBTest, InvalidOptionsAreRejectedAtOpen) {
+  const std::string name = TempDbName("bad_opts");
+  RemoveAll(name);
+
+  {
+    Options opt;
+    opt.create_if_missing = true;
+    opt.max_level_bytes_multiplier = 0;  // 会让 LevelCapacity 里 UINT64_MAX/0
+    DB* db = nullptr;
+    EXPECT_TRUE(DB::Open(opt, name, &db).IsInvalidArgument())
+        << "multiplier=0 应在 Open 被拒";
+    EXPECT_EQ(db, nullptr);
+  }
+  {
+    Options opt;
+    opt.create_if_missing = true;
+    opt.max_num_levels = 1;  // 没有 L1，压缩无处可去
+    DB* db = nullptr;
+    EXPECT_TRUE(DB::Open(opt, name, &db).IsInvalidArgument())
+        << "max_num_levels=1 应在 Open 被拒";
+    EXPECT_EQ(db, nullptr);
+  }
+  {
+    Options opt;
+    opt.create_if_missing = true;
+    opt.write_buffer_size = 0;
+    DB* db = nullptr;
+    EXPECT_TRUE(DB::Open(opt, name, &db).IsInvalidArgument())
+        << "write_buffer_size=0 应在 Open 被拒";
+    EXPECT_EQ(db, nullptr);
+  }
   RemoveAll(name);
 }
 }  // namespace

@@ -259,24 +259,37 @@ Status Table::Open(const InternalKeyComparator* icmp,
   t->meta_index_handle_ = f.meta_index_handle;
 
   // metaindex -> 过滤器块
+  //
+  // 【为什么这里必须区分"没有 filter"与"读不出来"】
+  // metaindex 读失败（CRC 不匹配 / 越界）说明**这个 SSTable 文件损坏了**。
+  // 若沿用旧写法（if (s.ok()) {...} 然后无条件 return OK），损坏的文件会被
+  // 当成正常表塞进 TableCache，表现为"该表没有布隆过滤器"——读放大上升，
+  // 而排障时看到的现象是"读变慢了"，根本想不到文件已损坏，损坏现场丢失。
+  //
+  // 两种合法情形仍要区分：
+  //   * ReadBlock 成功但没有 filter.* 条目 => 本来就没配过滤器，正常降级
+  //   * ReadBlock 失败                 => 文件损坏，必须上报
   std::string meta_contents;
   s = t->ReadBlock(f.meta_index_handle, &meta_contents);
-  if (s.ok()) {
+  if (!s.ok()) {
+    delete t;
+    return s;
+  }
+  {
     Block meta_block{Slice(meta_contents)};
     Block::Iter mit(&meta_block, icmp->user_comparator());
     for (mit.SeekToFirst(); mit.Valid(); mit.Next()) {
-      if (mit.key().starts_with("filter.")) {
-        BlockHandle fh;
-        Slice v = mit.value();
-        if (fh.DecodeFrom(&v).ok()) {
-          s = t->ReadBlock(fh, &t->filter_contents_);
-          if (!s.ok()) {
-            delete t;
-            return s;
-          }
+      if (!mit.key().starts_with("filter.")) continue;
+      BlockHandle fh;
+      Slice v = mit.value();
+      if (fh.DecodeFrom(&v).ok()) {
+        s = t->ReadBlock(fh, &t->filter_contents_);
+        if (!s.ok()) {
+          delete t;
+          return s;
         }
-        break;
       }
+      break;
     }
   }
 
