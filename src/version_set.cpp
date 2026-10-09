@@ -133,8 +133,9 @@ VersionSet::VersionSet(const std::string& dbname, Env* env,
                        const InternalKeyComparator* icmp)
     : dbname_(dbname), env_(env), icmp_(icmp) {
   manifest_name_ = Filename::ManifestFileName(dbname_);
-  // current_ 持有初始版本的一个所有权引用（refs_=1），这样 current()->TryRef()
-  // 才能从 1 累加成功；否则 refs_==0 会让 TryRef 永远返回 false、current() 死循环。
+  // current_ 持有初始版本的一个所有权引用（refs_=1）。这不是可选的优化，
+  // 而是 current() 正确性的前提：只有"当前 Version 永不归零、永不被 delete"，
+  // 读者才能在锁内安全 Ref 到一个确定存活的对象（详见 version_set.h 的 current()）。
   Version* init = new Version({});
   init->Ref();
   current_.store(init, std::memory_order_relaxed);
@@ -234,8 +235,13 @@ Status VersionSet::Recover(std::set<uint64_t>* live_files) {
 
   Version* v = new Version(files);
   v->Ref();  // 接手 VersionSet 对 current_ 的所有权引用
-  Version* old = current_.exchange(v, std::memory_order_acq_rel);
-  if (old) old->Unref();
+  // 换版本与释放旧版本必须在 current() 的同一把锁内完成，否则读者可能
+  // 已经 load 到 old 却还没来得及 Ref，old 就被这里 Unref 到 0 而 delete。
+  {
+    std::lock_guard<std::mutex> lk(version_mutex_);
+    Version* old = current_.exchange(v, std::memory_order_acq_rel);
+    if (old) old->Unref();
+  }
 
   // 打开 MANIFEST 供后续追加（从当前文件尾续写）
   uint64_t msize = 0;
@@ -262,8 +268,11 @@ Status VersionSet::LogAndApply(VersionEdit* edit) {
 
   Version* nv = new Version(files);
   nv->Ref();  // 接手 VersionSet 对 current_ 的所有权引用
-  Version* old = current_.exchange(nv, std::memory_order_acq_rel);
-  if (old) old->Unref();
+  {
+    std::lock_guard<std::mutex> lk(version_mutex_);
+    Version* old = current_.exchange(nv, std::memory_order_acq_rel);
+    if (old) old->Unref();
+  }
   return Status::OK();
 }
 

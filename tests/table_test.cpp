@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -19,6 +20,37 @@ static std::string IK(const std::string& user_key, SequenceNumber seq,
   AppendInternalKey(&k, ParsedInternalKey(user_key, seq, type));
   return k;
 }
+
+// 故障注入桩：第 fail_at 次 Append（0 基）失败，其余写入都成功。
+// TableBuilder 直接接受 WritableFile*（不经过 Env），所以实现这一个接口就够，
+// 不用去写一整套 TestEnv。
+//
+// 【为什么只让某一次失败、其余成功 —— 这个细节决定测试有没有意义】
+// 如果让 Append 全部失败，那么连最后写 footer 的那次 Append 也会失败，
+// status_ 恰好被置错，Finish() 自然返回错误 —— 就算中间块的错误根本没被
+// 传播，测试也会"通过"，属于假阳性。
+// 真实的缺陷 #1 恰恰是：中间块写失败被丢弃，随后 footer 写入成功并把
+// status_ 覆盖成 OK，Finish() 于是错误地报告成功。所以这里必须让中间块
+// 失败、footer 成功，才能真正区分"传播了"与"被吞了"。
+class FailingWritableFile : public WritableFile {
+public:
+  explicit FailingWritableFile(int fail_at) : fail_at_(fail_at) {}
+
+  Status Append(const Slice& data) override {
+    (void)data;  // 桩类不关心写入内容，只按调用次数决定何时失败
+    if (calls_++ == fail_at_) {
+      return Status::IOError("injected write failure");
+    }
+    return Status::OK();
+  }
+  Status Flush() override { return Status::OK(); }
+  Status Sync() override { return Status::OK(); }
+  Status Close() override { return Status::OK(); }
+
+private:
+  int fail_at_;
+  int calls_ = 0;
+};
 
 // 构造一个 SSTable：entries 为 (user_key, seq, type, value) 序列，必须按
 // internal_key 升序（即 user_key 升序、同 key 时 seq 降序）。
@@ -144,6 +176,89 @@ TEST(TableTest, BloomSkipsAbsentKey) {
   Status s = table->Get("zzz", 100, nullptr, &v, &found);
   ASSERT_FALSE(found);
   ASSERT_TRUE(s.IsNotFound());
+}
+
+// ---------------------------------------------------------------------------
+// 回归测试：写入错误必须向上传播（对应缺陷 #1）
+//
+// 背景：TableBuilder 过去会丢弃 WriteBlock / Append 的返回值，只有写 footer 时
+// 才设置 status_。于是磁盘满这类故障下 Finish() 依然返回 OK，上层会把一个缺块
+// 截断的 SSTable 登记进 MANIFEST 并删掉旧 WAL —— 数据静默丢失且无任何报错。
+// ---------------------------------------------------------------------------
+TEST(TableTest, BuilderPropagatesWriteFailureOnFinish) {
+  InternalKeyComparator icmp(BytewiseComparator());
+  // 第 0 次 Append（第一个 data block）失败，后面的 meta/index/footer 写入都成功。
+  FailingWritableFile file(/*fail_at=*/0);
+  TableBuilder builder(&icmp, &file, /*filter_policy=*/nullptr,
+                       /*block_size=*/4096);
+
+  builder.Add(IK("k1", 1, kTypeValue), "v1");
+
+  // block_size 足够大，数据块要到 Finish 才落盘 -> 错误在 Finish 暴露。
+  Status s = builder.Finish();
+  // 关键：footer 的写入是成功的。若中间块的失败没有被传播，status_ 会被
+  // footer 的成功覆盖成 OK，Finish() 就错误地报告成功（缺陷 #1 的表现）。
+  EXPECT_FALSE(s.ok()) << "Finish 必须上报中间块的写失败，不能被 footer 成功覆盖";
+  EXPECT_TRUE(s.IsIOError()) << "actual: " << s.ToString();
+}
+
+TEST(TableTest, BuilderStopsAfterWriteFailureDuringAdd) {
+  InternalKeyComparator icmp(BytewiseComparator());
+  FailingWritableFile file(/*fail_at=*/0);
+  // block_size=1 让每次 Add 都立刻切块落盘 -> 错误在 Add 期间就发生。
+  TableBuilder builder(&icmp, &file, /*filter_policy=*/nullptr,
+                       /*block_size=*/1);
+
+  builder.Add(IK("k1", 1, kTypeValue), "v1");  // 内部 Flush -> 第 0 次 Append 失败
+  // 关键：出错后继续 Add 必须是 no-op（status_ 已置错）。如果后续 Add 还往文件里
+  // 写东西，就等于在一个已经损坏的构建过程上叠加内容，问题更难定位。
+  builder.Add(IK("k2", 2, kTypeValue), "v2");
+
+  Status s = builder.Finish();
+  EXPECT_FALSE(s.ok()) << "Add 期间的写失败必须让整个 builder 作废";
+  EXPECT_TRUE(s.IsIOError()) << "actual: " << s.ToString();
+}
+
+// ---------------------------------------------------------------------------
+// 回归测试：越界 BlockHandle 必须被拒绝（对应缺陷 #3）
+//
+// 背景：ReadBlock 过去用 offset + size + trailer > file_size 做边界检查。
+// 三个 uint64 相加会回绕，一个接近 UINT64_MAX 的 offset 就能让这个判断失效，
+// 随后带着超大偏移发起 pread。现在改为无溢出的分步比较。
+// ---------------------------------------------------------------------------
+TEST(TableTest, OpenRejectsOutOfRangeBlockHandle) {
+  InternalKeyComparator icmp(BytewiseComparator());
+
+  // 手工构造一个"只有 footer"的最小 SSTable：magic 合法，但 index handle
+  // 指向文件之外，且取值接近 UINT64_MAX —— 正是旧的加法比较会被绕过的情形。
+  Footer footer;
+  footer.meta_index_handle = BlockHandle{0, 0};
+  footer.index_handle.offset = UINT64_MAX - 1;
+  footer.index_handle.size = UINT64_MAX;
+  std::string content;
+  footer.EncodeTo(&content);
+
+  std::string path;
+  Env::Default()->GetTestDirectory(&path);
+  path += "/table_bad_handle.ldb";
+  {
+    std::unique_ptr<WritableFile> file;
+    ASSERT_TRUE(Env::Default()->NewWritableFile(path, &file).ok());
+    ASSERT_TRUE(file->Append(content).ok());
+    ASSERT_TRUE(file->Sync().ok());
+    ASSERT_TRUE(file->Close().ok());
+  }
+
+  std::unique_ptr<RandomAccessFile> rf;
+  ASSERT_TRUE(Env::Default()->NewRandomAccessFile(path, &rf).ok());
+  uint64_t size = 0;
+  ASSERT_TRUE(Env::Default()->GetFileSize(path, &size).ok());
+
+  Table* table = nullptr;
+  Status s = Table::Open(&icmp, std::move(rf), size, &table);
+  // 必须报 Corruption：既不能崩溃，也不能"成功打开一个空表"把问题藏起来。
+  EXPECT_TRUE(s.IsCorruption()) << "actual: " << s.ToString();
+  EXPECT_EQ(table, nullptr);
 }
 
 }  // namespace

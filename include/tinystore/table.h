@@ -77,7 +77,10 @@ public:
   const std::string& LargestKey() const { return largest_key_; }
 
 private:
-  void Flush();  // 把当前 data block 落盘 + 记录待定索引键
+  // 把当前 data block 落盘 + 记录待定索引键。
+  // 返回值语义与 WriteBlock 一致：失败时同时把错误记入 status_，
+  // 使整个 TableBuilder 进入"作废"状态（后续 Add/Finish 均不再产生任何写入）。
+  Status Flush();
   Status WriteBlock(const Slice& block, BlockHandle* handle);  // 加 trailer 后写入
   Status WriteRawBlock(const Slice& contents, BlockHandle* handle);
 

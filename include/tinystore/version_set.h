@@ -78,19 +78,6 @@ class Version {
 public:
   void Ref() { refs_.fetch_add(1, std::memory_order_relaxed); }
 
-  // RCU 风格的"尝试引用"：仅当对象还活着（refs>0）时才加引用并返回 true。
-  // 配合 VersionSet::current() 的循环，使读路径无需任何锁即可安全拿到一个
-  // 不会被并发 flush 销毁的 Version（flush 换版本时旧 Version 可能正被销毁）。
-  bool TryRef() const {
-    int c = refs_.load(std::memory_order_relaxed);
-    while (c != 0) {
-      if (refs_.compare_exchange_weak(c, c + 1, std::memory_order_acq_rel,
-                                      std::memory_order_relaxed))
-        return true;
-    }
-    return false;
-  }
-
   void Unref() {
     if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) delete this;
   }
@@ -126,13 +113,28 @@ public:
   // 已提交的最大 sequence number（从 MANIFEST 恢复得到），供 DB 设定快照点。
   SequenceNumber LastSequence() const { return last_sequence_; }
 
-  // 当前活跃 Version（RCU：返回的 Version 已加好引用，调用方用完须 Unref）。
-  // 内部用 TryRef 循环，确保读路径全程无锁、且不会拿到正被 flush 销毁的旧版本。
+  // 当前活跃 Version（返回时已加好引用，调用方用完必须 Unref）。
+  //
+  // 【为什么这里必须加锁，而不能"load 指针 + TryRef 重试"】
+  // 曾经的写法是：先 load 拿裸指针，再 TryRef 加引用，失败就重新 load。
+  // 这个写法在原理上就是错的——TryRef 失败恰恰意味着"引用计数已归零、
+  // 对象可能正在被 delete"，而一旦 delete 完成，裸指针已悬垂，
+  // 此时无论重试多少次 load 都救不回来：读者已经在一个已释放对象上
+  // 调用了 TryRef，这就是 use-after-free。
+  //
+  // 正确性来自一条不变量：**VersionSet 始终持有 current_ 的所有权引用**
+  // （构造 / 换版本时都 Ref 过一次），因此"当前 Version"在运行期
+  // 永远不会归零、永远不会被 delete。把「load + Ref」整体放进写者
+  // 换版本所用的同一把锁，读写两侧就再无交错的可能：
+  //   读者：锁内 load + Ref        （此刻 current_ 必然存活，Ref 安全）
+  //   写者：锁内 exchange + Unref   （旧版本的最后一次 Unref 也在锁内）
+  //
+  // 临界区里只有指针获取与引用计数几条指令；真正耗时的读 SSTable、
+  // 跳表查找都在锁外，不影响读路径的并发度。
   Version* current() const {
-    Version* v = current_.load(std::memory_order_acquire);
-    while (v != nullptr && !v->TryRef()) {
-      v = current_.load(std::memory_order_acquire);
-    }
+    std::lock_guard<std::mutex> lk(version_mutex_);
+    Version* v = current_.load(std::memory_order_relaxed);
+    if (v != nullptr) v->Ref();  // 返回前即持有引用，调用方读到的一定是活对象
     return v;
   }
 
@@ -167,6 +169,10 @@ private:
   uint64_t log_number_ = 0;
 
   SequenceNumber last_sequence_ = 0;  // 从 MANIFEST 的 sequence 记录恢复
+
+  // 保护 current_ 的"读取 + 取引用"与"换版本 + 释放旧版本"，
+  // 使读者不可能拿到一个正被 flush 释放的 Version（详见 current() 的注释）。
+  mutable std::mutex version_mutex_;
 
   std::atomic<Version*> current_{nullptr};
 

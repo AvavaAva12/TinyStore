@@ -200,7 +200,15 @@ Status DBImpl::CompactMemTable() {
     env_->DeleteFile(fname);
     return s;
   }
-  file->Close();
+  // 【为什么要检查 Close 的返回值】
+  // 上面只 Sync 过数据内容，Close 还负责收尾（刷出剩余缓冲、归还文件描述符）。
+  // 它失败意味着这个 SSTable 可能并不完整；此时若继续把它登记进 MANIFEST，
+  // 就会在版本里留下一个打不开的文件，后续读该区间会直接失败。
+  s = file->Close();
+  if (!s.ok()) {
+    env_->DeleteFile(fname);
+    return s;
+  }
   file.reset();
 
   const uint64_t file_size = builder.FileSize();
@@ -253,8 +261,14 @@ Status DBImpl::CompactMemTable() {
   // 5) 切换 MemTable 到新的空表；旧表由正在读的线程 Ref 保活，这里释放 DB 的引用
   MemTable* new_mem = new MemTable(&icmp_);
   new_mem->Ref();
-  mem_.store(new_mem, std::memory_order_release);
-  imm->Unref();
+  {
+    // 换表与"释放旧表的 DB 引用"必须与 Get() 的"load + Ref"在同一把锁内完成：
+    // 否则读者可能刚 load 到 imm、还没来得及 Ref，imm 就被这里 Unref 到 0
+    // 而 delete，读者随后对悬垂指针操作跳表 —— use-after-free。
+    std::lock_guard<std::mutex> lk(mem_mutex_);
+    mem_.store(new_mem, std::memory_order_relaxed);
+    imm->Unref();
+  }
 
   return Status::OK();
 }
@@ -343,10 +357,16 @@ Status DBImpl::Delete(const Slice& key) {
 // Get：无锁快照读（MemTable -> SSTable，从新到旧）
 // ---------------------------------------------------------------------------
 Status DBImpl::Get(const Slice& key, std::string* value) {
-  // 1) MemTable（RCU 取引用，全程无锁；TryRef 成功即已持有引用）
-  MemTable* m = mem_.load(std::memory_order_acquire);
-  while (m != nullptr && !m->TryRef()) {
-    m = mem_.load(std::memory_order_acquire);
+  // 1) 取活跃 MemTable 的引用。
+  //    临界区内完成 load + Ref：mem_ 恒有 DB 持有的所有权引用，所以此刻
+  //    load 到的表必然存活，Ref 一定成功（对比旧的"load + TryRef 重试"写法，
+  //    那个写法在对象已被 delete 时会对悬垂指针调用 TryRef，属 use-after-free）。
+  //    锁内只有指针获取与引用计数，真正的数据读取全部在锁外。
+  MemTable* m = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(mem_mutex_);
+    m = mem_.load(std::memory_order_relaxed);
+    if (m != nullptr) m->Ref();
   }
   if (m == nullptr) return Status::NotFound("db not ready");
 
@@ -357,25 +377,41 @@ Status DBImpl::Get(const Slice& key, std::string* value) {
     m->Unref();
     return s;
   }
+  // 未命中：后续只查 SSTable，不再需要 MemTable 的引用，提前释放。
+  m->Unref();
 
   // 2) SSTable：从新到旧扫描；每个文件的 bloom 过滤器可整体跳过"一定不含"的文件
   Version* v = versions_->current();
+  if (v == nullptr) {
+    // 防御性检查：current() 在 current_ 为空时返回 nullptr。
+    return Status::Corruption("db: no current version");
+  }
   const FilterPolicy* fp = options_.filter_policy;
   for (int i = static_cast<int>(v->files().size()) - 1; i >= 0; --i) {
     const FileMetaData& f = v->files()[i];
     Table* table = versions_->GetTable(f.number);
+    // GetTable 打不开时只能跳过：它的接口没有 Status 出口，
+    // 无法区分"文件确实不在（孤儿清理后合法缺失）"与"文件损坏"。
+    // 要真正区分，需要 W5 把 GetTable 改成返回 Status。
     if (table == nullptr) continue;
     bool tfound = false;
     Status ts = table->Get(key, snapshot, fp, value, &tfound);
     if (tfound) {  // 本文件确有该 key 在 snapshot 下的版本（值或删除）-> 停止
       v->Unref();
-      m->Unref();
+      return ts;
+    }
+    // 【为什么非 NotFound 的错误必须上报，不能继续扫】
+    // NotFound 表示"这个文件里没有该 key 的任何版本"，继续找更老的文件是对的。
+    // 但 Corruption（块 CRC 不匹配、footer 非法、内部键无法解析）说明磁盘数据
+    // 已损坏——若一并当成 NotFound 吞掉，损坏会被静默伪装成"key 不存在"，
+    // 线上排障时看不到任何痕迹。这正是本项目要极力避免的"静默失败"。
+    if (!ts.ok() && !ts.IsNotFound()) {
+      v->Unref();
       return ts;
     }
   }
 
   v->Unref();
-  m->Unref();
   return Status::NotFound("not found");
 }
 

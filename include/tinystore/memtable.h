@@ -89,18 +89,11 @@ public:
   MemTable(const MemTable&) = delete;
   MemTable& operator=(const MemTable&) = delete;
 
+  // 引用计数：DB 始终持有"活跃 MemTable"的一个引用，flush 换表时才交出。
+  // 这条不变量保证活跃 MemTable 永不归零、永不被 delete，读者因此可以在
+  // DBImpl 的极短临界区内安全地取到引用（为什么需要那把锁、以及为什么
+  // 不能用"load + TryRef 重试"的写法，见 db.cpp 中 DBImpl::Get 的注释）。
   void Ref() { refs_.fetch_add(1, std::memory_order_relaxed); }
-  // RCU 风格尝试引用：仅当对象还活着（refs>0）时才加引用并返回 true。
-  // 供读路径在 flush 换表的瞬间无锁地安全取用 MemTable。
-  bool TryRef() const {
-    int c = refs_.load(std::memory_order_relaxed);
-    while (c != 0) {
-      if (refs_.compare_exchange_weak(c, c + 1, std::memory_order_acq_rel,
-                                      std::memory_order_relaxed))
-        return true;
-    }
-    return false;
-  }
   void Unref() {
     if (refs_.fetch_sub(1, std::memory_order_acq_rel) == 1) delete this;
   }
@@ -118,8 +111,16 @@ public:
   Status Get(const Slice& user_key, SequenceNumber snapshot,
              std::string* value, bool* found = nullptr) const;
 
-  // 近似内存占用（节点 + 记录，均由 Arena 统计）
-  size_t ApproximateMemoryUsage() const { return arena_.MemoryUsage(); }
+  // 【为什么统计"记录字节数"而不是 Arena 的分配量】
+  // arena_.MemoryUsage() 统计的是"向系统申请了多少内存"，其中包含 Arena 预留的
+  // 内存块（首个块通常就有数 KB）。拿它去比 write_buffer_size 时，只要阈值小于
+  // Arena 首块大小，条件就恒成立——于是每次 Put 都会触发 flush，产出海量只含
+  // 一条记录的小 SSTable（实测 2000 次写入生成 2000 个文件，读放大与文件数量
+  // 都严重劣化）。而 write_buffer_size 的语义本该是"我真正写进去多少字节"。
+  // 这里改为累加记录的实际字节数，让阈值重新具有"按数据量 flush"的意义。
+  size_t ApproximateMemoryUsage() const {
+    return data_size_.load(std::memory_order_relaxed);
+  }
 
   // ---- 迭代器：用于 flush / 调试，按 user_key 升序 + sequence 降序遍历 ----
   class Iterator {
@@ -151,6 +152,9 @@ private:
   Arena arena_;
   SkipList<const char*, MemTableKeyComparator> table_;
   mutable std::atomic<int> refs_;
+  // 累计写入的记录字节数（仅数据本身，不含 Arena 预留块），用于 flush 阈值判断。
+  // 用 atomic 是为了将来若在读路径上查询也不必再加锁；写路径本身是单线程。
+  std::atomic<size_t> data_size_{0};
   // 只保护"写"路径。读路径（Get）走跳表的无锁读，不取这把锁——
   // 这样快照读完全不被前台写阻塞（见 W3 设计笔记）。跳表本身假设"单写者"，
   // 因此 Add 必须串行（由 DB 的写者队列或这把锁保证），Get 则可多读者并发。

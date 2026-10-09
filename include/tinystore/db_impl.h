@@ -38,8 +38,13 @@ struct Writer {
 //   * 恢复：Open 时重放 MANIFEST 重建 Version（SSTable 集合 + 当前 WAL 编号），
 //     再重放当前 WAL 把未 flush 的数据填回 MemTable。
 //
-// 读路径全程无锁：memtable 与 Version 都用 RCU 风格的 TryRef 安全取引用，
-// SSTable 读取走 pread（线程安全），与 W3 的"无锁快照读"一脉相承。
+// 读路径的并发模型：**取引用走极短临界区，数据访问全程无锁**。
+//   * 取 MemTable / Version 的引用时，会短暂进入 mem_mutex_ / version_mutex_。
+//     这两把锁只保护"指针获取 + 引用计数"，不包含任何数据访问，因此不构成
+//     读写竞争。为什么这里必须加锁、以及为什么不能用"load 裸指针 + 失败重试"
+//     的写法（那样是 use-after-free），见 VersionSet::current() 的注释。
+//   * 临界区之外：MemTable 查找走跳表的无锁遍历，Version 遍历与 SSTable 读取
+//     走 pread（天然线程安全），与 W3 的"无锁快照读"一脉相承。
 class DBImpl : public DB {
 public:
   DBImpl(const Options& options, const std::string& name);
@@ -66,11 +71,13 @@ private:
 
   // --- 写路径同步（同 W3）---
   std::mutex mutex_;
-  std::condition_variable cv_;
-  std::deque<Writer*> writers_;
+  std::deque<Writer*> writers_;  // 等待提交的写请求队列（Group Commit）
 
-  // --- 内存状态（读路径无锁访问）---
-  std::atomic<MemTable*> mem_{nullptr};  // 活跃 MemTable；flush 时 RCU 换出
+  // --- 内存状态 ---
+  // 保护 mem_ 的"读取 + 取引用"与"换表 + 释放旧表"这两个动作，
+  // 使读者不可能拿到一个正在被 flush 释放的 MemTable。
+  std::mutex mem_mutex_;
+  std::atomic<MemTable*> mem_{nullptr};  // 活跃 MemTable；flush 时换出
   std::atomic<SequenceNumber> last_sequence_{0};
 
   // --- WAL ---

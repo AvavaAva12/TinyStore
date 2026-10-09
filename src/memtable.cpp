@@ -36,6 +36,10 @@ void MemTable::Add(SequenceNumber seq, ValueType type, const Slice& key,
   // 3) 把记录指针交给跳表（跳表负责分配节点并链入）
   std::lock_guard<std::mutex> lock(mu_);
   table_.Insert(rec);
+
+  // 4) 累加实际数据量，供 ApproximateMemoryUsage() 判断何时 flush。
+  //    放在锁外累加即可：fetch_add 自身原子，且只做统计、不影响正确性。
+  data_size_.fetch_add(record_size, std::memory_order_relaxed);
 }
 
 Status MemTable::Get(const Slice& user_key, SequenceNumber snapshot,

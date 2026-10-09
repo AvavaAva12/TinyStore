@@ -1,5 +1,6 @@
 #include "tinystore/table.h"
 
+#include <cassert>
 #include <cstring>
 #include <vector>
 
@@ -41,6 +42,12 @@ void Footer::EncodeTo(std::string* dst) const {
   index_handle.EncodeTo(&handles);
   dst->resize(kFooterSize, 0);
   if (!handles.empty()) {
+    // 两个 BlockHandle 各至多 2 个 varint64 = 20 字节，合计 40 字节，
+    // 恰好等于 footer 里留给句柄的空间（kFooterSize - kTableMagicNumberSize）。
+    // 当前是安全的，但依赖的是"varint64 最长 10 字节"这个编码细节——
+    // 用断言把这个不变量显式固定下来，万一编码方式变化会立刻暴露，
+    // 而不是变成一次静默的 memcpy 越界写。
+    assert(handles.size() <= kFooterSize - kTableMagicNumberSize);
     std::memcpy(dst->data(), handles.data(), handles.size());
   }
   EncodeFixed64(dst->data() + kFooterSize - kTableMagicNumberSize, kTableMagic);
@@ -96,11 +103,19 @@ Status TableBuilder::WriteRawBlock(const Slice& contents, BlockHandle* handle) {
   return WriteBlock(contents, handle);  // 过滤器已是最终字节，直接加 trailer 写入
 }
 
-void TableBuilder::Flush() {
-  if (data_block_.empty()) return;
-  WriteBlock(data_block_.Finish(), &pending_handle_);
+Status TableBuilder::Flush() {
+  if (data_block_.empty()) return Status::OK();
+  Status s = WriteBlock(data_block_.Finish(), &pending_handle_);
+  if (!s.ok()) {
+    // 落盘失败：把错误记入 status_，让整个 TableBuilder 作废。
+    // 关键在于「失败的文件绝不能被当成构建成功」——否则上层会把一个
+    // 缺块/截断的 SSTable 登记进 MANIFEST 并删掉旧 WAL，数据静默丢失。
+    status_ = s;
+    return s;
+  }
   data_block_.Reset();
   pending_index_entry_ = true;
+  return Status::OK();
 }
 
 void TableBuilder::Add(const Slice& key, const Slice& value) {
@@ -126,12 +141,20 @@ void TableBuilder::Add(const Slice& key, const Slice& value) {
   }
 
   if (data_block_.CurrentSizeEstimate() >= block_size_) {
-    Flush();
+    // 错误已记入 status_，此处提前返回；后续 Add 会被开头的 status_ 检查挡住。
+    if (!Flush().ok()) return;
   }
 }
 
 Status TableBuilder::Finish() {
-  Flush();  // 写完最后一个 data block
+  // 【错误汇聚原则】status_ 是唯一的错误汇聚点：任何一次写入失败都立刻记入
+  // status_ 并返回，后续 Add() 开头与本函数开头的检查会保证不再产生任何写入。
+  // 这样"构建失败"与"文件内容残缺"就不可能同时出现——上层拿到非 OK 状态时，
+  // 文件里可能是旧数据，但绝不会是一个被误认为完整的 SSTable。
+  if (!status_.ok()) return status_;
+
+  Status s = Flush();  // 写完最后一个 data block
+  if (!s.ok()) return s;
 
   if (pending_index_entry_) {
     // 最后一个 data block 的索引键：用 last_key_ 的最短严格后继
@@ -151,7 +174,11 @@ Status TableBuilder::Finish() {
     std::string filter;
     filter_policy_->CreateFilter(keys.data(), static_cast<int>(keys.size()),
                                  &filter);
-    WriteRawBlock(filter, &filter_handle);
+    s = WriteRawBlock(filter, &filter_handle);
+    if (!s.ok()) {
+      status_ = s;
+      return s;
+    }
   }
 
   // metaindex 块：把过滤器句柄登记到 "filter.<policy>"
@@ -163,11 +190,19 @@ Status TableBuilder::Finish() {
     meta_index_block.Add(Slice(key), Slice(handle_encoding));
   }
   BlockHandle meta_handle;
-  WriteBlock(meta_index_block.Finish(), &meta_handle);
+  s = WriteBlock(meta_index_block.Finish(), &meta_handle);
+  if (!s.ok()) {
+    status_ = s;
+    return s;
+  }
 
   // index 块
   BlockHandle index_handle;
-  WriteBlock(index_block_.Finish(), &index_handle);
+  s = WriteBlock(index_block_.Finish(), &index_handle);
+  if (!s.ok()) {
+    status_ = s;
+    return s;
+  }
 
   // footer
   Footer footer;
@@ -175,8 +210,12 @@ Status TableBuilder::Finish() {
   footer.index_handle = index_handle;
   std::string footer_encoding;
   footer.EncodeTo(&footer_encoding);
-  status_ = file_->Append(footer_encoding);
-  if (status_.ok()) offset_ += footer_encoding.size();
+  s = file_->Append(footer_encoding);
+  if (s.ok()) {
+    offset_ += footer_encoding.size();
+  } else {
+    status_ = s;
+  }
   return status_;
 }
 
@@ -247,7 +286,17 @@ Status Table::Open(const InternalKeyComparator* icmp,
 Table::~Table() = default;
 
 Status Table::ReadBlock(const BlockHandle& handle, std::string* contents) const {
-  if (handle.offset + handle.size + kBlockTrailerSize > file_size_) {
+  // 【为什么不能写成 offset + size + trailer > file_size_】
+  // handle 来自磁盘上的 footer，属于不可信输入。三项相加在 uint64 里会回绕：
+  // 一个接近 UINT64_MAX 的 offset 加上 size 会绕回成小数，让这个检查形同虚设，
+  // 随后就带着超大 offset 发起 pread。这里改成分步的无溢出比较，
+  // 任何异常大的值都会在第一步（offset 越界）或第二步（size 越界/放不下 trailer）被拦下。
+  if (handle.offset > file_size_) {
+    return Status::Corruption("read block past end of file");
+  }
+  const uint64_t remaining = file_size_ - handle.offset;
+  // 先判 size <= remaining 再做减法，避免 remaining - handle.size 自身下溢。
+  if (handle.size > remaining || remaining - handle.size < kBlockTrailerSize) {
     return Status::Corruption("read block past end of file");
   }
   std::string buf;
