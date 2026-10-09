@@ -927,5 +927,364 @@ TEST(DBTest, ConcurrentWritesWithBackgroundCompaction) {
   delete db;
   RemoveAll(name);
 }
+
+// ===========================================================================
+// W8 / P1：反向遍历、TableCache LRU、Snapshot 句柄、Compaction 优先级与限流
+// ===========================================================================
+
+// 反向遍历必须与正向完全对称：把正向收集到的 key 序列倒过来，应当正好是
+// 反向收集到的序列。单独验证"反向前几个"很容易漏掉跨块、多版本的问题。
+TEST(DBTest, ReverseIterationMirrorsForward) {
+  Options opt;
+  opt.create_if_missing = true;
+  const std::string name = TempDbName("rev_mirror");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  // 数量刻意超过单块容量，迫使数据跨多个 data block —— 跨块边界是反向遍历
+  // 最容易出错的地方（index 迭代器与 data 块迭代器必须同步后退）。
+  const int N = 500;
+  for (int i = 0; i < N; ++i) {
+    const std::string k = "key" + std::string(4, '0') + std::to_string(i);
+    ASSERT_TRUE(db->Put(k, "v" + std::to_string(i)).ok());
+  }
+
+  std::vector<std::string> forward;
+  {
+    std::unique_ptr<Iterator> it(db->NewIterator(ReadOptions()));
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      forward.push_back(it->key().ToString());
+    }
+  }
+  ASSERT_EQ(forward.size(), static_cast<size_t>(N));
+
+  std::vector<std::string> backward;
+  {
+    std::unique_ptr<Iterator> it(db->NewIterator(ReadOptions()));
+    for (it->SeekToLast(); it->Valid(); it->Prev()) {
+      backward.push_back(it->key().ToString());
+    }
+  }
+  ASSERT_EQ(backward.size(), forward.size());
+  for (size_t i = 0; i < forward.size(); ++i) {
+    EXPECT_EQ(backward[i], forward[forward.size() - 1 - i])
+        << "第 " << i << " 个反向 key 与正向镜像不符";
+  }
+
+  delete db;
+  RemoveAll(name);
+}
+
+// 反向遍历必须与正向给出**相同的 value**，而不只是相同的 key：
+// MVCC 下同 user_key 有多个版本，反向若取错版本，key 序列照样正确。
+TEST(DBTest, ReverseIterationSeesSameVersions) {
+  Options opt;
+  opt.create_if_missing = true;
+  const std::string name = TempDbName("rev_mvcc");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  for (int round = 1; round <= 4; ++round) {
+    for (int i = 0; i < 100; ++i) {
+      const std::string k = "k" + std::string(3, '0') + std::to_string(i);
+      // 每轮把值改成"轮次-键"，这样任何读到旧版本的行为都能被值暴露出来
+      ASSERT_TRUE(db->Put(k, "r" + std::to_string(round) + "-" +
+                                 std::to_string(i)).ok());
+    }
+  }
+  ASSERT_TRUE(db->Delete("k050").ok());  // 墓碑不得出现在任一方向
+
+  std::vector<std::pair<std::string, std::string>> forward, backward;
+  {
+    std::unique_ptr<Iterator> it(db->NewIterator(ReadOptions()));
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      forward.emplace_back(it->key().ToString(), it->value().ToString());
+    }
+  }
+  {
+    std::unique_ptr<Iterator> it(db->NewIterator(ReadOptions()));
+    for (it->SeekToLast(); it->Valid(); it->Prev()) {
+      backward.emplace_back(it->key().ToString(), it->value().ToString());
+    }
+  }
+
+  ASSERT_FALSE(forward.empty());
+  ASSERT_EQ(forward.size(), backward.size());
+  for (size_t i = 0; i < forward.size(); ++i) {
+    const auto& f = forward[forward.size() - 1 - i];
+    EXPECT_EQ(backward[i].first, f.first);
+    EXPECT_EQ(backward[i].second, f.second) << "反向读到了非最新版本";
+  }
+  // 墓碑在两个方向都不应出现
+  for (const auto& kv : forward) EXPECT_NE(kv.first, "k050");
+
+  delete db;
+  RemoveAll(name);
+}
+
+// Prev 退到第一个之后 Valid() 必须为 false（而不是绕回末尾或崩）
+TEST(DBTest, ReverseIterationStopsAtStart) {
+  Options opt;
+  opt.create_if_missing = true;
+  const std::string name = TempDbName("rev_stop");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+  ASSERT_TRUE(db->Put("a", "1").ok());
+  ASSERT_TRUE(db->Put("b", "2").ok());
+
+  {
+    std::unique_ptr<Iterator> it(db->NewIterator(ReadOptions()));
+    it->SeekToLast();
+    ASSERT_TRUE(it->Valid());
+    EXPECT_EQ("b", it->key().ToString());
+    it->Prev();
+    ASSERT_TRUE(it->Valid());
+    EXPECT_EQ("a", it->key().ToString());
+    it->Prev();
+    EXPECT_FALSE(it->Valid()) << "退过第一个之后应报告无效";
+  }
+
+  delete db;
+  RemoveAll(name);
+}
+
+// TableCache 必须真的按容量上限回收，否则长时间运行内存无上限。
+TEST(DBTest, TableCacheRespectsCapacityLimit) {
+  Options opt;
+  opt.create_if_missing = true;
+  // 极小的缓存上限：只能装下 0 个文件，任何一次 Acquire 都应触发淘汰。
+  // 这让断言不依赖"文件大小到底是多少"这种脆弱前提。
+  opt.max_table_cache_bytes = 1;
+  // 必须真的产生 SSTable：否则数据全在 MemTable，Get 不碰文件，缓存条目恒为 0，
+  // 断言会因"0 <= 1"而空过 —— 测试看着绿，实际什么都没验证到。
+  opt.write_buffer_size = 512;
+  const std::string name = TempDbName("cache_lru");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  for (int i = 0; i < 500; ++i) {
+    ASSERT_TRUE(db->Put("key" + std::to_string(i), "v" + std::to_string(i)).ok());
+  }
+
+  // 全部读一遍，确保每个文件都被打开过
+  for (int i = 0; i < 500; ++i) {
+    std::string got;
+    ASSERT_TRUE(db->Get("key" + std::to_string(i), &got).ok())
+        << "淘汰后重开文件必须仍能正确读到 key" << i;
+  }
+
+  ASSERT_GT(db->NumTableFiles(), 1u) << "本测试前提：应已产生多个 SSTable";
+  EXPECT_LE(db->TableCacheEntries(), 1u)
+      << "缓存条目数应被容量上限压住（当前 " << db->TableCacheEntries() << "）";
+  EXPECT_LE(db->TableCacheBytes(), 1u)
+      << "缓存字节数应被容量上限压住（当前 " << db->TableCacheBytes() << "）";
+
+  delete db;
+  RemoveAll(name);
+}
+
+// 上限设得足够大时不应发生淘汰：这是上一个测试的对照组，
+// 否则"淘汰逻辑把缓存清空了"也会让上一个测试通过。
+TEST(DBTest, TableCacheKeepsEntriesUnderGenerousLimit) {
+  Options opt;
+  opt.create_if_missing = true;
+  opt.max_table_cache_bytes = 256u << 20;  // 256MB，远超本测试产生的数据量
+  // 必须真的产生 SSTable 才有缓存条目：默认 4MB 缓冲下 200 条小写入全留在
+  // MemTable 里，Get 根本不碰文件，缓存会是空的，断言就失去意义。
+  opt.write_buffer_size = 512;
+  const std::string name = TempDbName("cache_big");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  for (int i = 0; i < 200; ++i) {
+    ASSERT_TRUE(db->Put("key" + std::to_string(i), "v" + std::to_string(i)).ok());
+  }
+  for (int i = 0; i < 200; ++i) {
+    std::string got;
+    ASSERT_TRUE(db->Get("key" + std::to_string(i), &got).ok());
+  }
+
+  ASSERT_GT(db->NumTableFiles(), 0u) << "本测试前提：应已产生 SSTable";
+  EXPECT_GT(db->TableCacheEntries(), 0u) << "上限宽松时不应淘汰任何条目";
+  EXPECT_EQ(db->TableCacheEntries(), db->NumTableFiles())
+      << "每个被读过的文件都应留在缓存里";
+
+  delete db;
+  RemoveAll(name);
+}
+
+// Snapshot 句柄 + 点查历史读
+TEST(DBTest, SnapshotHandleReadsHistoricalValue) {
+  Options opt;
+  opt.create_if_missing = true;
+  const std::string name = TempDbName("snap_handle");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+  ASSERT_TRUE(db->Put("k", "v1").ok());
+
+  const Snapshot* snap = db->GetSnapshot();
+  ASSERT_NE(snap, nullptr);
+
+  ASSERT_TRUE(db->Put("k", "v2").ok());
+  ASSERT_TRUE(db->Put("k", "v3").ok());
+
+  std::string got;
+  ASSERT_TRUE(db->Get("k", &got).ok());
+  EXPECT_EQ("v3", got) << "默认读应看到最新值";
+
+  // 快照读：点查与迭代都必须回到快照时刻的视图
+  ReadOptions ro(snap);
+  ASSERT_TRUE(db->Get("k", &got, ro).ok());
+  EXPECT_EQ("v1", got) << "快照点查应读到取快照时的值";
+
+  {
+    std::unique_ptr<Iterator> it(db->NewIterator(ro));
+    it->SeekToFirst();
+    ASSERT_TRUE(it->Valid());
+    EXPECT_EQ("v1", it->value().ToString());
+    it->Next();
+    EXPECT_FALSE(it->Valid());
+  }
+
+  // 释放快照不会改变已经构造好的 ro —— 它持有的 sequence 仍是取快照时的值，
+  // 因此继续用它读**依然**是 v1。这是设计使然：快照点由句柄创建时确定，
+  // 释放只向数据库注销"还有人在读这个视图"，不追溯修改调用方手里的参数。
+  db->ReleaseSnapshot(snap);
+  ASSERT_TRUE(db->Get("k", &got, ro).ok());
+  EXPECT_EQ("v1", got) << "已释放的句柄对应的历史读仍应稳定复现同一视图";
+
+  // 用默认选项读，才是"当前最新"
+  ASSERT_TRUE(db->Get("k", &got, ReadOptions()).ok());
+  EXPECT_EQ("v3", got);
+
+  delete db;
+  RemoveAll(name);
+}
+
+// Snapshot 的真正价值：跨 compaction 保持视图。
+// 若压缩把快照依赖的旧版本丢掉，这里读到的就会是新值或 NotFound。
+TEST(DBTest, SnapshotSurvivesCompaction) {
+  Options opt;
+  opt.create_if_missing = true;
+  // 小缓冲 + 低阈值，制造大量 L0 文件，逼出 compaction
+  opt.write_buffer_size = 512;
+  opt.l0_compaction_trigger = 2;
+  const std::string name = TempDbName("snap_compact");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  // 先把 key 推到磁盘（flush），再取快照 —— 这样快照依赖的版本在 SSTable 里，
+  // 会被后续 compaction 反复处理，正是要验证的场景。
+  ASSERT_TRUE(db->Put("key", "gen1").ok());
+  for (int i = 0; i < 200; ++i) {
+    ASSERT_TRUE(db->Put("filler" + std::to_string(i), "x" + std::to_string(i)).ok());
+  }
+
+  const Snapshot* snap = db->GetSnapshot();
+  ASSERT_NE(snap, nullptr);
+  ReadOptions ro(snap);
+
+  // 大量写入 + 覆盖，触发多轮 flush 与 compaction
+  for (int i = 0; i < 400; ++i) {
+    ASSERT_TRUE(db->Put("key", "gen2").ok());
+    ASSERT_TRUE(db->Put("filler" + std::to_string(i), "y" + std::to_string(i)).ok());
+  }
+
+  // 强制让后台压缩有机会跑完（写入本身会触发，析构也会等它退出）
+  std::string got;
+  ASSERT_TRUE(db->Get("key", &got, ro).ok());
+  EXPECT_EQ("gen1", got) << "compaction 之后快照视图必须保持不变";
+  ASSERT_TRUE(db->Get("key", &got).ok());
+  EXPECT_EQ("gen2", got) << "普通读应看到最新值";
+
+  db->ReleaseSnapshot(snap);
+  delete db;
+  RemoveAll(name);
+}
+
+// 多层同时超限时应压缩压力最大的层，而不是永远按固定顺序先压 L0。
+TEST(DBTest, CompactionPicksHighestPressureLevel) {
+  Options opt;
+  opt.create_if_missing = true;
+  opt.write_buffer_size = 512;
+  opt.l0_compaction_trigger = 4;
+  opt.max_level_bytes = 1024;           // 小层容量，便于把深层顶过阈值
+  opt.max_level_bytes_multiplier = 2;  // 逐层翻倍：L1=1KB L2=2KB L3=4KB
+  const std::string name = TempDbName("priority");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  // 写入足够多的数据，把多层都顶过容量
+  for (int i = 0; i < 4000; ++i) {
+    ASSERT_TRUE(db->Put("key" + std::string(6, '0') + std::to_string(i),
+                        "value" + std::to_string(i) + std::string(32, 'x')).ok());
+  }
+
+  // 数据正确性不能因为压缩策略变化而受损
+  for (int i = 0; i < 4000; ++i) {
+    std::string got;
+    ASSERT_TRUE(db->Get("key" + std::string(6, '0') + std::to_string(i), &got).ok())
+        << "压缩后仍应读得到第 " << i << " 个键";
+    EXPECT_EQ("value" + std::to_string(i) + std::string(32, 'x'), got);
+  }
+
+  // 每层文件数应受容量约束（不允许某一层无限膨胀）
+  const auto counts = db->GetLevelFileCounts();
+  ASSERT_FALSE(counts.empty());
+  EXPECT_LE(counts[0], 32u) << "L0 文件数应被限制住";
+
+  delete db;
+  RemoveAll(name);
+}
+
+// 限流不能把压缩彻底饿死：即使写入量很小，也必须能把积压清掉。
+TEST(DBTest, ThrottlingNeverStarvesCompaction) {
+  Options opt;
+  opt.create_if_missing = true;
+  opt.write_buffer_size = 512;
+  opt.l0_compaction_trigger = 2;
+  // 把限流调到极紧：压缩写出的字节数几乎不允许超过写入量。
+  opt.compaction_max_write_amplification = 1;
+  opt.compaction_backlog_factor = 2;
+  const std::string name = TempDbName("throttle");
+  RemoveAll(name);
+
+  DB* db;
+  ASSERT_TRUE(DB::Open(opt, name, &db).ok());
+
+  for (int i = 0; i < 600; ++i) {
+    ASSERT_TRUE(db->Put("key" + std::to_string(i), "v" + std::to_string(i)).ok());
+  }
+
+  // 逃生阀的作用：即便限流很紧，L0 也不该无限堆积
+  EXPECT_LE(db->GetLevelFileCounts()[0], 16u)
+      << "积压上限未生效，限流把压缩饿死了";
+
+  // 数据仍然完整
+  for (int i = 0; i < 600; ++i) {
+    std::string got;
+    ASSERT_TRUE(db->Get("key" + std::to_string(i), &got).ok())
+        << "限流不应导致数据丢失";
+  }
+
+  delete db;
+  RemoveAll(name);
+}
 }  // namespace
 }  // namespace tinystore

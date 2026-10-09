@@ -149,8 +149,11 @@ private:
 
 class VersionSet {
 public:
+  // max_cache_bytes：SSTable 缓存的容量上限（字节）。超过后按 LRU 淘汰。
+  // 传 0 表示不淘汰，保持 W4~W7 的"只增不减"行为。
   VersionSet(const std::string& dbname, Env* env,
-             const InternalKeyComparator* icmp);
+             const InternalKeyComparator* icmp,
+             uint64_t max_cache_bytes = 0);
   ~VersionSet();
 
   VersionSet(const VersionSet&) = delete;
@@ -228,9 +231,36 @@ public:
 
   void OpenTableLocked(uint64_t number, Table** out);
 
+  // --- 缓存自省（供测试断言 LRU 确实在生效）---
+  size_t CacheEntries() const {
+    std::lock_guard<std::mutex> lk(cache_mutex_);
+    return table_cache_.size();
+  }
+  uint64_t CacheBytes() const {
+    std::lock_guard<std::mutex> lk(cache_mutex_);
+    return cache_bytes_;
+  }
+
 private:
   Status WriteManifestRecord(const VersionEdit& edit);
   Status OpenManifestForAppend(uint64_t manifest_size);
+
+  // 在 cache_mutex_ 已持有时调用：把缓存总字节数压回上限以下。
+  //
+  // 【淘汰谁】
+  // 按 last_used_ 升序（最久未使用优先）扫描，**跳过 refs > 0 的条目**——
+  // 那些正被读者使用，delete 掉就是 use-after-free。跳过后继续找下一个可淘汰的，
+  // 直到缓存降到阈值以下或没有可淘汰条目为止。
+  //
+  // 【被跳过的条目会不会饿死】
+  // 不会：一个正在被读的条目在被读完（ReleaseTable）之前无法回收，但下一轮
+  // AcquireTable 触发淘汰时它仍会被考虑。读者持有引用的时间是有限的（单次点查
+  // 或一次归并），因此不会出现永久无法回收的条目。
+  //
+  // 【evicted 条目不参与】
+  // 已被 compaction 标记淘汰的条目由 EvictTable/ReleaseTable 负责释放，
+  // 这里跳过它们，避免两套逻辑重复释放同一个 Table。
+  void EvictLeastRecentlyUsedLocked();
 
   std::string dbname_;
   Env* env_;
@@ -258,14 +288,24 @@ private:
   //   refs    —— 当前有多少读者（Get / Compaction 归并）正持有该 Table
   //   evicted —— 已被 compaction 标记为待淘汰，等引用归零后真正 delete
   // 没有这两个字段，compaction 一 delete 就会把并发读者手里的裸指针变成悬垂指针。
+  //
+  // W8 再加两个字段把缓存从"只增不减"变成"有界"：
+  //   last_used —— 单调递增的访问序号，AcquireTable 时刷新；LRU 淘汰按它排序
+  //   size      —— 该 SSTable 的字节数，用于累计缓存占用并与上限比较
   struct TableEntry {
     Table* table = nullptr;
     int refs = 0;
     bool evicted = false;
+    uint64_t last_used = 0;
+    uint64_t size = 0;
   };
 
   mutable std::mutex cache_mutex_;
   std::map<uint64_t, TableEntry> table_cache_;
+
+  uint64_t cache_bytes_ = 0;      // 当前缓存占用的总字节数
+  uint64_t max_cache_bytes_ = 0;  // 上限；0 表示不淘汰
+  uint64_t cache_clock_ = 0;      // 访问序号发号器，保证 last_used 单调递增
 };
 
 }  // namespace tinystore

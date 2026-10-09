@@ -145,8 +145,8 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
 // ===========================================================================
 
 VersionSet::VersionSet(const std::string& dbname, Env* env,
-                       const InternalKeyComparator* icmp)
-    : dbname_(dbname), env_(env), icmp_(icmp) {
+                       const InternalKeyComparator* icmp, uint64_t max_cache_bytes)
+    : dbname_(dbname), env_(env), icmp_(icmp), max_cache_bytes_(max_cache_bytes) {
   manifest_name_ = Filename::ManifestFileName(dbname_);
   // current_ 持有初始版本的一个所有权引用（refs_=1）。这不是可选的优化，
   // 而是 current() 正确性的前提：只有"当前 Version 永不归零、永不被 delete"，
@@ -311,13 +311,56 @@ Table* VersionSet::AcquireTable(uint64_t number) {
     Table* t = nullptr;
     OpenTableLocked(number, &t);
     if (t == nullptr) return nullptr;
-    it = table_cache_.emplace(number, TableEntry{t, 0, false}).first;
+    TableEntry entry;
+    entry.table = t;
+    entry.size = t->FileSize();
+    it = table_cache_.emplace(number, entry).first;
+    cache_bytes_ += entry.size;
   }
   // 已标记淘汰的文件不再交给新读者：它的内容已经被 compaction 取代，
   // 新读者应该去读新的 Version 里的文件。
   if (it->second.evicted) return nullptr;
   ++it->second.refs;
+  // 刷新访问时间。必须在 Ref 之后做：新读者确实要用它了。
+  // 即使本次 AcquireTable 最终把条目淘汰掉，这里刷新的 last_used 也无妨——
+  // 淘汰只在"超过容量上限且该条目无人使用时"发生，refs>0 会挡住它。
+  it->second.last_used = ++cache_clock_;
+  // 新条目可能让缓存超标，这里顺带做一次回收。放在 Ref 之后是为了让
+  // 当前读者持有的表不会被本次调用自己淘汰掉。
+  EvictLeastRecentlyUsedLocked();
   return it->second.table;
+}
+
+void VersionSet::EvictLeastRecentlyUsedLocked() {
+  if (max_cache_bytes_ == 0) return;  // 未设上限，保持"只增不减"
+  if (cache_bytes_ <= max_cache_bytes_) return;
+
+  // 收集可淘汰条目，按 last_used 升序（最久未使用在前）。
+  //
+  // 【为什么用局部 vector 排序，而不是每次都扫全表】
+  // 淘汰是 O(n log n) 但只发生在超限时；若把排序留在 map 的遍历里，
+  // 每次 AcquireTable 都要付这个代价，而绝大多数时候根本没超限。
+  // 先用 O(n) 收集 + 提前退出判断，超限时才付排序的钱。
+  std::vector<std::pair<uint64_t, uint64_t>> candidates;  // (last_used, number)
+  candidates.reserve(table_cache_.size());
+  for (const auto& kv : table_cache_) {
+    // 跳过正被读者使用的、以及已由 compaction 标记淘汰的条目。
+    if (kv.second.refs > 0 || kv.second.evicted) continue;
+    candidates.emplace_back(kv.second.last_used, kv.first);
+  }
+  std::sort(candidates.begin(), candidates.end());
+
+  for (const auto& c : candidates) {
+    if (cache_bytes_ <= max_cache_bytes_) break;
+    auto it = table_cache_.find(c.second);
+    if (it == table_cache_.end()) continue;
+    // 复查：收集期间可能有并发 ReleaseTable 把 refs 降到 0（不影响），
+    // 也可能有新的读者进来。锁内检查是权威判据。
+    if (it->second.refs > 0 || it->second.evicted) continue;
+    delete it->second.table;
+    cache_bytes_ -= it->second.size;
+    table_cache_.erase(it);
+  }
 }
 
 void VersionSet::ReleaseTable(uint64_t number) {
@@ -325,11 +368,16 @@ void VersionSet::ReleaseTable(uint64_t number) {
   auto it = table_cache_.find(number);
   if (it == table_cache_.end()) return;
   if (--it->second.refs > 0) return;
-  // 引用归零：只有被标记淘汰的才真正释放，其余留在缓存里复用
+  // 引用归零：只有被标记淘汰的才真正释放，其余留在缓存里复用。
+  // 释放后条目变成"可被 LRU 回收"的候选——若此时缓存已超标，
+  // 本次释放正好腾出的额度就顺手用掉。
   if (it->second.evicted) {
     delete it->second.table;
+    cache_bytes_ -= it->second.size;
     table_cache_.erase(it);
+    return;
   }
+  EvictLeastRecentlyUsedLocked();
 }
 
 void VersionSet::EvictTable(uint64_t number) {
@@ -341,6 +389,7 @@ void VersionSet::EvictTable(uint64_t number) {
   // 直接 delete 会把并发读者手里的裸指针变成悬垂指针。
   if (it->second.refs <= 0) {
     delete it->second.table;
+    cache_bytes_ -= it->second.size;
     table_cache_.erase(it);
   }
 }

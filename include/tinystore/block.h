@@ -76,21 +76,42 @@ public:
   public:
     explicit Iter(const Block* block, const Comparator* cmp);
 
-    void SeekToFirst();
-    void Seek(const Slice& target);   // 第一个 key >= target
-    void Next();
-    bool Valid() const { return valid_; }
-    Slice key() const { return Slice(key_); }
-    Slice value() const { return Slice(value_); }
+        void SeekToFirst();
+        void SeekToLast();
+        void Seek(const Slice& target);   // 第一个 key >= target
+        void Next();
+        void Prev();
+        bool Valid() const { return valid_; }
+        Slice key() const { return Slice(key_); }
+        Slice value() const { return Slice(value_); }
 
-  private:
-    // 解析位于 offset 的 entry，prev_key 为前一条完整 key（用于前缀还原）。
-    // 成功时填充 *out_key/*out_value，并把 *next_offset 指向本条之后的偏移。
-    bool ParseEntry(uint32_t offset, const std::string& prev_key,
-                    std::string* out_key, std::string* out_value,
-                    uint32_t* next_offset);
+       private:
+        // 解析位于 offset 的 entry，prev_key 为前一条完整 key（用于前缀还原）。
+        // 成功时填充 *out_key/*out_value，并把 *next_offset 指向本条之后的偏移。
+        bool ParseEntry(uint32_t offset, const std::string& prev_key,
+                        std::string* out_key, std::string* out_value,
+                        uint32_t* next_offset);
 
-    const Block* block_;
+        // 正向扫描区间 [start_off, limit_off)，把其中**最后一个** entry 填入出参。
+        // 区间为空返回 false。
+        //
+        // 【为什么反向遍历需要它】
+        // 前缀压缩让"往回走一步"没法直接解析：entry 头里只有"与前一条共享多少字节"，
+        // 要还原前一条的完整 key，必须知道它**之前**那条的完整 key —— 形成一条依赖链。
+        // 正向扫描可以顺着链往前走，反向不行。
+        //
+        // 于是反向定位采用"先正向重扫一小段、再取其一"的策略：从 current_ 所属的
+        // 重启点重新扫到 current_，扫过的最后一个 entry 就是答案。这样每个 entry
+        // 只需 O(重启间隔) 次比较（默认间隔 16），而不是 O(块内全部 entry)。
+        // 重启点机制正是为此存在——没有它，反向遍历就得从块首重扫，退化成 O(n)。
+        bool FindLastBefore(uint32_t start_off, uint32_t limit_off, uint32_t* out_off,
+                            std::string* out_key, std::string* out_value,
+                            uint32_t* out_next);
+
+        // 二分：返回最大的 i，使 restarts[i] <= offset（即 offset 落在哪个区间）。
+        uint32_t RestartIndexFor(uint32_t offset) const;
+
+        const Block* block_;
     const Comparator* cmp_;
     uint32_t current_ = 0;     // 当前 entry 在块内的起始偏移
     uint32_t next_offset_ = 0; // 当前 entry 之后的偏移

@@ -218,6 +218,101 @@ void Block::Iter::Next() {
   }
 }
 
+bool Block::Iter::FindLastBefore(uint32_t start_off, uint32_t limit_off,
+                                 uint32_t* out_off, std::string* out_key,
+                                 std::string* out_value, uint32_t* out_next) {
+  if (start_off >= limit_off) return false;
+  uint32_t off = start_off;
+  std::string prev_key;
+  uint32_t next = start_off;
+  bool found = false;
+  while (off < limit_off) {
+    std::string k, v;
+    if (!ParseEntry(off, prev_key, &k, &v, &next)) return false;  // 块损坏
+    prev_key = k;
+    *out_off = off;
+    out_key->assign(k);
+    out_value->assign(v);
+    *out_next = next;
+    found = true;
+    off = next;
+  }
+  return found;
+}
+
+uint32_t Block::Iter::RestartIndexFor(uint32_t offset) const {
+  // 不变式：restarts_[0] == 0，所以 lo 初始一定满足 restarts[lo] <= offset。
+  uint32_t lo = 0, hi = block_->num_restarts_;
+  while (lo + 1 < hi) {
+    const uint32_t mid = lo + (hi - lo) / 2;
+    if (DecodeFixed32(block_->restarts_ptr_ + 4 * mid) <= offset) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+void Block::Iter::SeekToLast() {
+  if (block_->num_restarts_ == 0) {
+    valid_ = false;
+    return;
+  }
+  // 最后一个重启点所在区间就是块尾区间，扫到 entries_end 即为最后一条。
+  restart_index_ = block_->num_restarts_ - 1;
+  const uint32_t start = DecodeFixed32(block_->restarts_ptr_ + 4 * restart_index_);
+  uint32_t off = 0, next = 0;
+  std::string k, v;
+  if (!FindLastBefore(start, block_->entries_end_, &off, &k, &v, &next)) {
+    valid_ = false;
+    return;
+  }
+  current_ = off;
+  key_ = k;
+  value_ = v;
+  next_offset_ = next;
+  valid_ = true;
+}
+
+void Block::Iter::Prev() {
+  if (!valid_) return;
+
+  // 1) 定位当前 entry 落在哪个重启点区间
+  const uint32_t ri = RestartIndexFor(current_);
+  const uint32_t start = DecodeFixed32(block_->restarts_ptr_ + 4 * ri);
+
+  uint32_t off = 0, next = 0;
+  std::string k, v;
+
+  // 2) 同区间内向前找（current_ 不在区间首时成立）
+  if (FindLastBefore(start, current_, &off, &k, &v, &next)) {
+    current_ = off;
+    key_ = k;
+    value_ = v;
+    next_offset_ = next;
+    return;  // valid_ 保持 true
+  }
+
+  // 3) current_ 就是该区间的第一条 —— 前一个 entry 在**上一个区间**里。
+  //    若它已经是块里第一条，则没有前驱，遍历结束。
+  if (ri == 0) {
+    valid_ = false;
+    return;
+  }
+  const uint32_t prev_start = DecodeFixed32(block_->restarts_ptr_ + 4 * (ri - 1));
+  const uint32_t prev_end = start;  // == restarts[ri]
+  if (!FindLastBefore(prev_start, prev_end, &off, &k, &v, &next)) {
+    valid_ = false;
+    return;
+  }
+  restart_index_ = ri - 1;
+  current_ = off;
+  key_ = k;
+  value_ = v;
+  next_offset_ = next;
+}
+
 // cstdint / vector 已在头文件包含；这里补一条避免某些编译单元的未用告警。
 static_assert(kBlockTrailerSize == 5, "block trailer size");
 

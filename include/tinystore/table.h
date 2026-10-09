@@ -151,6 +151,11 @@ public:
 
   uint64_t ApproximateOffsetOf(const Slice& key) const;  // 供 Compaction 估算（W5）
 
+  // 文件总字节数。TableCache 按它计费做 LRU 淘汰（W8），所以要对外暴露——
+  // 常驻的索引块与过滤器只是其中一小部分，把它当作"这个缓存条目的成本"，
+  // 数量级上足以反映真实的内存占用。
+  uint64_t FileSize() const { return file_size_; }
+
 private:
   friend class detail::TableIterator;
 

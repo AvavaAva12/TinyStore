@@ -3,6 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <string>
 
@@ -54,7 +55,12 @@ public:
   Status Put(const Slice& key, const Slice& value) override;
   Status Delete(const Slice& key) override;
   Status Get(const Slice& key, std::string* value) override;
+  Status Get(const Slice& key, std::string* value,
+             const ReadOptions& options) override;
   Status Write(const WriteBatch& batch) override;
+
+  const Snapshot* GetSnapshot() override;
+  void ReleaseSnapshot(const Snapshot* snapshot) override;
 
   // 组装 DBIterator：MemTable + 全部 SSTable 作为归并的数据源。
   std::unique_ptr<Iterator> NewIterator(
@@ -64,6 +70,13 @@ public:
   Status Recover();
 
 private:
+  // 当前最早的活跃快照；没有活跃快照时返回 kMaxSequenceNumber。
+  //
+  // Compaction 用它当归并的快照下界：只有比它更新的版本之外、且该 user_key 在
+  // 它处最新的那个版本才需要保留。更老的版本对任何活跃读都没用了，可以丢。
+  // 没有活跃快照时返回 kMaxSequenceNumber，即"可以丢掉所有被更新覆盖的旧版本"
+  // ——这正是 W6 以来 compaction 一直在做的事，也是它写放大低的原因。
+  SequenceNumber EarliestSnapshot() const;
   // 把活跃 MemTable flush 成一个 SSTable（登记进版本），并滚动 WAL。
   // 必须在持有 mutex_ 的写者（leader）上下文中调用。
   Status CompactMemTable();
@@ -111,14 +124,19 @@ private:
   std::vector<size_t> GetLevelFileCounts() const override;
   std::vector<size_t> GetLevelBytes() const override;
   size_t NumTableFiles() const override;
+  size_t TableCacheEntries() const override;
+  uint64_t TableCacheBytes() const override;
 
   // 按各层容量阈值挑出一个需要压缩的层；返回 -1 表示当前无需压缩。
-  // 优先压 L0（L0 文件互相重叠，对点查最不友好），其次自下而上找超容量的层。
+  // 按"超限倍数"最大的优先（见实现处的注释），并列时偏向小 level。
   int PickCompactionLevel(const Version* v) const;
 
   // level 层的容量上限（字节）。level 越大容量按 multiplier 递增，
   // 这是把"写入总量"摊平成"每层固定大小"的经典做法。
   uint64_t LevelCapacity(int level) const;
+
+  // 当前是否应暂缓压缩（写放大限流 + L0 积压逃生阀，见实现处注释）。
+  bool CompactionThrottled(const Version* v) const;
 
   Env* env_;
   const Comparator* user_comparator_;
@@ -138,6 +156,19 @@ private:
   mutable std::mutex mem_mutex_;
   std::atomic<MemTable*> mem_{nullptr};  // 活跃 MemTable；flush 时换出
   std::atomic<SequenceNumber> last_sequence_{0};
+
+  // --- 活跃快照登记簿（W8）---
+  //
+  // sequence -> 引用计数。同一个 sequence 可能被多个快照句柄共用（两次
+  // GetSnapshot 之间没有新写入时序号相同），所以用计数而不是集合。
+  // Compaction 取 map 的最小键即最早快照，据此决定要保留哪些旧版本。
+  //
+  // 【为什么不能让快照无限存活】
+  // 一个长期持有的快照会阻止 compaction 丢弃它之前的所有旧版本，等于冻结了
+  // 半个数据库、让写放大无限上升。这是使用者的责任（用完立刻 Release），
+  // 但我们至少提供 EarliestSnapshot 让压缩能感知到它的存在。
+  mutable std::mutex snapshot_mu_;
+  std::map<uint64_t, uint32_t> snapshots_;
 
   // --- WAL ---
   WritableFile* logfile_ = nullptr;  // 活跃 WAL（不拥有，析构时关闭）
@@ -170,6 +201,18 @@ private:
   // 增减都在 compaction_mu_ 保护下完成，与 shutdown_ 的判定处于同一临界区，
   // 因此不会出现"析构以为没人跑、任务却刚开始"的空档。
   std::atomic<int> active_compactions_{0};
+
+  // --- 写放大统计（W8：compaction 限流的依据）---
+  //
+  // bytes_written_          用户写入的累计字节数（写路径累加）
+  // compaction_bytes_written_ compaction 输出的累计字节数（压缩路径累加）
+  // 写放大 = 两者之比，Limit 选项把它约束在给定倍数内。
+  //
+  // 用 relaxed 是足够的：这两个计数只用于"要不要现在压"的启发式判断，
+  // 读到略陈旧的值最多让本轮压缩提前/推迟一次，不影响正确性——
+  // 真正的正确性由 VersionSet 的锁与 MANIFEST 提交点保证。
+  std::atomic<uint64_t> bytes_written_{0};
+  std::atomic<uint64_t> compaction_bytes_written_{0};
 };
 
 }  // namespace tinystore

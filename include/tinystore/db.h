@@ -14,6 +14,50 @@ namespace tinystore {
 
 class WriteBatch;  // 仅作参数类型，前向声明即可
 
+// ===========================================================================
+// Snapshot —— 一个稳定的读视图（时间旅行的句柄）
+// ===========================================================================
+//
+// 【为什么不能只把 sequence 抄进 ReadOptions】
+// ReadOptions::snapshot 是一个裸数字，它能表达"读 seq<=100 的版本"，但表达不了
+// "从现在起，我要一致地读 seq<=100 这个视图，直到我主动放弃"。缺的是**生命周期**：
+// 快照需要被数据库知道"还有人在读它"，这样压缩才能保留它依赖的旧版本。
+//
+// 举一个会真实出错的例子：
+//   1. 读到一半，取 ReadOptions{snapshot=100}
+//   2. 期间别人写入 seq=200，并触发一次 compaction
+//   3. compaction 压平了 seq=100 与 seq=200，旧版本被丢弃
+//   4. 回到第 1 步的扫描 —— 若序列号还在，却读不到 seq<=100 的版本了
+// 有了 Snapshot 句柄，第 3 步就知道"100 还有活跃读者"，压缩必须保留它。
+//
+// 【典型用法】
+//     const Snapshot* snap = db->GetSnapshot();
+//     ReadOptions ro;
+//     ro.snapshot = snap->sequence();
+//     ... 多次 Get / 迭代，全程一致 ...
+//     db->ReleaseSnapshot(snap);
+// 快照必须先于 DB 释放（与 Iterator 同样的约定）。
+class DBImpl;  // 仅用于 friend 声明：快照只能由数据库实现创建
+
+class Snapshot {
+public:
+  // 该快照对应的 sequence：读它只能看到 seq <= 这个值的版本。
+  SequenceNumber sequence() const { return sequence_; }
+
+  Snapshot(const Snapshot&) = delete;
+  Snapshot& operator=(const Snapshot&) = delete;
+
+private:
+  // 只有 DBImpl 能创建快照。把它设为 private 是为了让"快照点从哪来"这件事
+  // 只有一处决定（GetSnapshot 里读 last_sequence_），避免调用方凭空造一个
+  // sequence 出来——那种快照数据库根本不知道，旧版本可能早被 compaction 丢弃。
+  friend class DBImpl;
+  explicit Snapshot(SequenceNumber seq) : sequence_(seq) {}
+  ~Snapshot() = default;
+
+  SequenceNumber sequence_;
+};
+
 // ---------------------------------------------------------------------------
 // ReadOptions —— 读操作的参数
 // ---------------------------------------------------------------------------
@@ -23,6 +67,12 @@ struct ReadOptions {
   // 默认 kMaxSequenceNumber，即"读当前所有已提交数据"，与 Get 的行为一致。
   // 传一个具体值即可做历史读（time travel）：拿到某个时刻的数据库视图。
   SequenceNumber snapshot = kMaxSequenceNumber;
+
+  // 从 Snapshot 句柄直接构造，省去手抄 sequence() 的样板：
+  //     ReadOptions ro(db->GetSnapshot());
+  explicit ReadOptions(const Snapshot* s)
+      : snapshot(s != nullptr ? s->sequence() : kMaxSequenceNumber) {}
+  ReadOptions() = default;
 };
 
 // ===========================================================================
@@ -78,7 +128,39 @@ struct Options {
   // 单个 compaction 输出文件的目标大小。归并结果超过它就切成多个文件——
   // 否则一次大归并可能产出一个巨大文件，下次读它的代价过高。
   uint64_t max_compaction_file_size = 2u << 20;  // 2MB
-};
+
+    // --- W8：SSTable 缓存（TableCache）容量上限 ---
+
+    // 已打开的 SSTable 会缓存各自的索引块与过滤器，避免每次点查都重读 footer。
+    // 但缓存若只增不减，长期运行会把**整个数据库**的索引常驻内存，内存占用无上限。
+    // 超过此字节数时按 LRU 淘汰最久未使用的条目。
+    //
+    // 设为 0 表示不淘汰（等价于关闭缓存容量限制，行为与 W4~W7 一致）。
+    //
+    // 【为什么不按"打开文件数"限制】
+    // 内存占用与文件**大小**强相关（索引块随数据量增长），而与文件个数关系较弱；
+    // 按字节数限流才能真正约束内存。
+    uint64_t max_table_cache_bytes = 64u << 20;  // 64MB
+
+    // --- W8：Compaction 限流 ---
+
+    // Compaction 写入的字节数上限 = 前台写入字节数 × 该比例。
+    //
+    // 【为什么需要限流】
+    // Compaction 与前台写共享同一条磁盘带宽。若压缩长期跑得比写入快很多，
+    // 它会持续抢占 IO、反复搬运同一批数据（"写放大"失控），把前台写入的
+    // 延迟顶高。有界化后，压缩只能在"写入停下来"的那部分带宽里做功。
+    //
+    // 【逃生阀：积压上限】
+    // 限流不能无限期地推迟压缩——否则 L0 会无限堆积文件，读放大爆掉。
+    // 因此 L0 文件数一旦超过 l0_compaction_trigger × 该系数，就**无视限流强制压缩**。
+    // 正常情况按限流节流，异常积压时兜底，两者结合才不会两头出问题。
+    uint64_t compaction_max_write_amplification = 1;  // 压缩写入 <= 写入量 × 1
+
+    // 强制压缩的积压倍数（相对 l0_compaction_trigger）。设为 0 表示不做兜底，
+    // 此时若写入量长期为 0（纯读库），压缩会被限流无限期推迟。
+    int compaction_backlog_factor = 4;
+  };
 
 // ===========================================================================
 // DB —— 数据库句柄（纯虚接口，具体实现见 db_impl.h 的 DBImpl）
@@ -109,6 +191,21 @@ public:
   //   OK + *value          —— 找到
   //   NotFound             —— 不存在，或最新可见版本是删除墓碑
   virtual Status Get(const Slice& key, std::string* value) = 0;
+
+  // 带读选项的点查。options.snapshot 指定快照点，实现历史读。
+  //
+  // 【为什么必须有这个重载】
+  // 没有它，Snapshot 只能用于 NewIterator——点查仍然永远读"最新"，
+  // 快照对最常见的访问路径无效，上面的 Snapshot 注释里那个"扫描中途被压缩
+  // 掉旧版本"的场景在点查上同样会发生。
+  virtual Status Get(const Slice& key, std::string* value,
+                     const ReadOptions& options) = 0;
+
+  // ---- 快照句柄（见 Snapshot 的注释：为什么需要生命周期）----
+
+  // 取一个读视图。返回值归调用方所有，必须配对 ReleaseSnapshot。
+  virtual const Snapshot* GetSnapshot() = 0;
+  virtual void ReleaseSnapshot(const Snapshot* snapshot) = 0;
 
   // 原子地写入一批修改。W3 的 Group Commit 在此实现：
   // 多个并发 Write 会被合并成一组，整组只做一次 WAL fsync。
@@ -153,6 +250,11 @@ public:
 
   // SSTable 文件总数。
   virtual size_t NumTableFiles() const = 0;
+
+  // 已打开的 SSTable 缓存条目数 / 占用字节数。用于断言"缓存确实有界"
+  // （Options::max_table_cache_bytes 生效），否则内存占用会随写入无限增长。
+  virtual size_t TableCacheEntries() const = 0;
+  virtual uint64_t TableCacheBytes() const = 0;
 };
 
 }  // namespace tinystore

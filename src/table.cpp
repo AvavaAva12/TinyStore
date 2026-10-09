@@ -436,6 +436,19 @@ public:
     valid_ = data_iter_->Valid();
   }
 
+  void SeekToLast() override {
+    if (!status_.ok()) return;
+    index_iter_.SeekToLast();
+    if (!index_iter_.Valid()) {  // 空表
+      valid_ = false;
+      return;
+    }
+    LoadCurrentBlock();
+    if (!data_iter_) return;
+    data_iter_->SeekToLast();                 // 块内从尾开始
+    valid_ = data_iter_->Valid();
+  }
+
   // 按 user_key 定位到它的最新版本。
   //
   // 对外约定 target 是裸 user_key（与 Get 一致），但块内查找用的是完整
@@ -467,6 +480,25 @@ public:
       LoadCurrentBlock();
       if (!data_iter_) return;
       data_iter_->SeekToFirst();              // 新块从头开始
+    }
+    valid_ = data_iter_ && data_iter_->Valid();
+  }
+
+  // 反向跨块：与 Next 完全对称，只是 index 迭代器往回走、数据块从尾开始。
+  //
+  // 【为什么不需要额外记录"当前在第几个块"】
+  // index_iter_ 自己就是当前位置的权威（它正停在产生当前 data block 的那个
+  // index entry 上），Block::Iter::Prev 在块内退回无效时只需让 index_iter_
+  // 再退一条，语义天然对齐。
+  void Prev() override {
+    if (!Valid()) return;
+    data_iter_->Prev();
+    while (data_iter_ && !data_iter_->Valid()) {
+      // 当前块退到头，进入上一个块。
+      if (!PrevIndexEntry()) return;
+      LoadCurrentBlock();
+      if (!data_iter_) return;
+      data_iter_->SeekToLast();               // 新块从尾开始
     }
     valid_ = data_iter_ && data_iter_->Valid();
   }
@@ -509,6 +541,15 @@ private:
     index_iter_.Next();
     if (!index_iter_.Valid()) {
       valid_ = false;  // 正常遍历到文件末尾
+      return false;
+    }
+    return true;
+  }
+
+  bool PrevIndexEntry() {
+    index_iter_.Prev();
+    if (!index_iter_.Valid()) {
+      valid_ = false;  // 正常遍历到文件开头
       return false;
     }
     return true;

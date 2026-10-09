@@ -58,8 +58,10 @@ class TableReleasingIterator : public Iterator {
 
   bool Valid() const override { return inner_->Valid(); }
   void SeekToFirst() override { inner_->SeekToFirst(); }
+  void SeekToLast() override { inner_->SeekToLast(); }
   void Seek(const Slice& target) override { inner_->Seek(target); }
   void Next() override { inner_->Next(); }
+  void Prev() override { inner_->Prev(); }
   Slice key() const override { return inner_->key(); }
   Slice value() const override { return inner_->value(); }
   Status status() const override { return inner_->status(); }
@@ -82,7 +84,9 @@ DBImpl::DBImpl(const Options& options, const std::string& name)
       icmp_(user_comparator_),
       options_(options),
       dbname_(name) {
-  versions_ = new VersionSet(dbname_, env_, &icmp_);
+  // 把缓存容量上限交给 VersionSet：它内部按 LRU 淘汰，DB 只提供策略参数。
+  versions_ = new VersionSet(dbname_, env_, &icmp_,
+                             options_.max_table_cache_bytes);
 }
 
 DBImpl::~DBImpl() {
@@ -368,12 +372,78 @@ uint64_t DBImpl::LevelCapacity(int level) const {
   return cap;
 }
 
+// 按各层"压力"挑出一个最需要压缩的层；返回 -1 表示当前无需压缩。
+//
+// 【为什么要按压力排序，而不是"固定先 L0，再自下而上找第一个"】
+// 固定顺序隐含一个假设：L0 超了就是最紧急的。但真实负载下多层可能同时超限，
+// 固定顺序会让靠后的层**长期得不到压缩** —— 每一轮都在处理更紧急的 L0，
+// 底层无限增长，读放大持续恶化，只是恶化得慢一点。
+//
+// 改为比较"超限倍数"（实际值 / 阈值，取最大者）后，压力最大的层总是先被处理，
+// 不存在某个层被无限期跳过的情况。
+//
+// 【并列时偏向小 level】
+// 严格大于才替换，因此遍历顺序（level 升序）天然让 L0 在同压力下优先。
+// 理由：L0 文件互相键范围重叠，点查要整层扫，对延迟最不友好；高层可以二分
+// 定位到唯一文件，同样压力的代价更小。
 int DBImpl::PickCompactionLevel(const Version* v) const {
-  if (v->NumLevelFiles(0) >= options_.l0_compaction_trigger) return 0;
-  for (int lvl = 1; lvl < options_.max_num_levels; ++lvl) {
-    if (v->LevelBytes(lvl) > LevelCapacity(lvl)) return lvl;
+  int best = -1;
+  double best_pressure = 1.0;  // 未超过阈值（1.0）不算需要压缩
+
+  for (int lvl = 0; lvl < options_.max_num_levels; ++lvl) {
+    double pressure = 0.0;
+    if (lvl == 0) {
+      // L0 不用字节数触发：它的产出速率由写入决定，问题在"文件多且互相重叠"，
+      // 用文件数衡量更贴近点查的真实代价（每多一个 L0 文件就多一次
+      // 打开 + 读 footer + 读索引）。
+      pressure = static_cast<double>(v->NumLevelFiles(0)) /
+                 static_cast<double>(options_.l0_compaction_trigger);
+    } else {
+      const uint64_t cap = LevelCapacity(lvl);
+      if (cap == 0) continue;
+      pressure = static_cast<double>(v->LevelBytes(lvl)) /
+                 static_cast<double>(cap);
+    }
+    if (pressure > best_pressure) {
+      best_pressure = pressure;
+      best = lvl;
+    }
   }
-  return -1;
+  return best;
+}
+
+// 当前是否应当**暂缓**压缩（限流）。
+//
+// 【限流的必要性】
+// Compaction 与前台写共享同一条磁盘带宽。若它长期跑得比写入快很多，会持续
+// 抢占 IO —— 表现为前台写延迟抬升，而 CPU 和内存都在空转。用一个"写放大"
+// 上限把压缩的总产出约束住，让它只能在写入让出的那部分带宽里做功。
+//
+// 【为什么必须有逃生阀】
+// 只按写放大限流有一个致命副作用：**纯读负载下压缩会被永久推迟**。
+// 极端情况下写入为 0、预算也为 0，压缩一次都做不了，而此时 L0 可能正堆积着
+// 上次退出时留下的文件，读放大只会越来越糟。
+//
+// 所以叠加一个积压判据：L0 文件数一旦超过 l0_trigger × backlog_factor，
+// 说明已经"欠了太多"，此时无视限流强制压缩。
+//
+// 【为什么用累计字节数而不是速率】
+// 速率（字节/秒）需要维护滑动窗口，且在测试里难以稳定复现；累计字节数
+// 与"写放大"这个 LSM 的标准指标直接对应，写放大 = 总产出 / 用户写入，
+// 限流即"写放大不超过配置值"，语义清晰且与磁盘状态无关。
+bool DBImpl::CompactionThrottled(const Version* v) const {
+  const int factor =
+      options_.compaction_backlog_factor > 0 ? options_.compaction_backlog_factor : 4;
+  const uint64_t backlog_cap =
+      static_cast<uint64_t>(options_.l0_compaction_trigger) *
+      static_cast<uint64_t>(factor);
+  // 逃生阀：积压到硬上限，强制压缩，不再看预算。
+  if (static_cast<uint64_t>(v->NumLevelFiles(0)) >= backlog_cap) return false;
+
+  const uint64_t budget =
+      bytes_written_.load(std::memory_order_relaxed) *
+      options_.compaction_max_write_amplification;
+  return compaction_bytes_written_.load(std::memory_order_relaxed) >= budget;
 }
 
 // 判断 [a.smallest, a.largest] 与 [b.smallest, b.largest] 是否键范围重叠。
@@ -435,15 +505,22 @@ Status DBImpl::CompactLevel(int level) {
     v->Unref();
   }
 
-  // 3) 归并。用 DBIterator 串起所有输入源：它按 internal_key 有序归并，并自动
-  //    过滤掉被更新的旧版本与墓碑，输出的正是"该文件最终形态"的内容。
-  //    snapshot 用 kMaxSequenceNumber 表示"要全部可见"，因为这里要的是
-  //    把所有版本压平成最新状态，而不是某个时刻的视图。
+  // 3) 归并。用 DBIterator 串起所有输入源：它按 internal_key 有序归并，并按
+  //    compaction 规则决定哪些版本该留（见 DBIterator 的"Compaction 模式"）。
+  //
+  //    snapshot 传**最早活跃快照**（无活跃快照时是 kMaxSequenceNumber）：
+  //    * 无活跃快照时 = kMaxSequenceNumber，每个 user_key 只留最新版，
+  //      写放大最低——这是 W6 以来一直的行为；
+  //    * 有活跃快照时保留该快照依赖的版本，历史读才不会在压缩中途失效。
+  //
+  //    drop_tombstones 只在最底层为 true：中间层必须让墓碑继续下沉，
+  //    否则该 key 在更深层的旧版本会失去遮挡而"复活"（W6 遗留的缺陷）。
   std::vector<FileMetaData> outputs;
   {
     // borrow 先声明、merged 后声明 => 析构时 merged 先走、borrow 再归还引用。
     TableBorrow borrow(versions_);
-    DBIterator merged(&icmp_, kMaxSequenceNumber);
+    DBIterator merged(&icmp_, EarliestSnapshot(), /*for_compaction=*/true,
+                      /*drop_tombstones=*/next_is_final);
     for (uint64_t num : input_numbers) {
       Table* t = versions_->AcquireTable(num);
       if (t == nullptr) continue;  // 打不开就跳过，与 Get 的处理一致
@@ -489,6 +566,9 @@ Status DBImpl::CompactLevel(int level) {
         meta.file_size = builder->FileSize();
         meta.smallest = builder->SmallestKey();
         meta.largest = builder->LargestKey();
+        // 计入写放大统计：限流靠它与用户写入量比较（见 CompactionThrottled）。
+        compaction_bytes_written_.fetch_add(meta.file_size,
+                                            std::memory_order_relaxed);
         outputs.push_back(std::move(meta));
       }
       out_file.reset();
@@ -593,14 +673,19 @@ void DBImpl::BackgroundCompactionTask() {
   // 循环压到收敛：一次压缩可能又把下一层顶过阈值，循环才能真正停下来。
   for (int guard = 0; guard < 64; ++guard) {
     int trigger = -1;
+    bool throttled = false;
     {
       Version* cur = versions_->current();
       if (cur != nullptr) {
         trigger = PickCompactionLevel(cur);
+        if (trigger >= 0) throttled = CompactionThrottled(cur);
         cur->Unref();
       }
     }
     if (trigger < 0) break;
+    // 被限流就退出本轮。下次写入会让预算增长、进而重新触发，
+    // 所以不会"忘了压"——若真到了积压上限，CompactionThrottled 本身就返回 false。
+    if (throttled) break;
     Status s = CompactLevel(trigger);
     if (!s.ok()) break;  // 出错就停手，等下次写入再触发
   }
@@ -667,6 +752,10 @@ size_t DBImpl::NumTableFiles() const {
   return n;
 }
 
+size_t DBImpl::TableCacheEntries() const { return versions_->CacheEntries(); }
+
+uint64_t DBImpl::TableCacheBytes() const { return versions_->CacheBytes(); }
+
 // ---------------------------------------------------------------------------
 // Write：Group Commit（同 W3）+ 阈值触发 flush
 // ---------------------------------------------------------------------------
@@ -717,6 +806,12 @@ Status DBImpl::Write(const WriteBatch& my_batch) {
     // 先回放内存，再 release 发布新的 last_sequence_
     last_sequence_.store(seq + combined.Count() - 1, std::memory_order_release);
 
+    // 用户写入量：compaction 限流的预算基准（见 CompactionThrottled）。
+    // 用 batch 编码后的长度而非解压后的 key+value——它正比于实际数据量，
+    // 却不需要再遍历一遍 batch，且包含了写放大统计本来就该计入的协议开销。
+    bytes_written_.fetch_add(combined.Contents().size(),
+                             std::memory_order_relaxed);
+
     // W4：MemTable 涨过阈值则 flush（在持有 mutex_ 的 leader 里同步完成）
     if (m->ApproximateMemoryUsage() > options_.write_buffer_size) {
       s = CompactMemTable();
@@ -757,6 +852,48 @@ Status DBImpl::Delete(const Slice& key) {
 // Get：无锁快照读（MemTable -> SSTable，从新到旧）
 // ---------------------------------------------------------------------------
 Status DBImpl::Get(const Slice& key, std::string* value) {
+  return Get(key, value, ReadOptions());
+}
+
+// ---------------------------------------------------------------------------
+// 快照句柄：登记 / 注销，并回答"最早的活跃快照是谁"
+// ---------------------------------------------------------------------------
+const Snapshot* DBImpl::GetSnapshot() {
+  // 快照点取"此刻已提交的最大 sequence"：它之后写入的内容对本次读不可见。
+  // 用 acquire 语义读，与写路径发布 last_sequence_ 的 release 配对，
+  // 确保能看到该 sequence 之前的所有写入（否则刚写完立刻取快照会读不到）。
+  const SequenceNumber seq = last_sequence_.load(std::memory_order_acquire);
+  {
+    std::lock_guard<std::mutex> lk(snapshot_mu_);
+    ++snapshots_[seq];
+  }
+  return new Snapshot(seq);
+}
+
+void DBImpl::ReleaseSnapshot(const Snapshot* snapshot) {
+  if (snapshot == nullptr) return;
+  {
+    std::lock_guard<std::mutex> lk(snapshot_mu_);
+    const uint64_t seq = snapshot->sequence();
+    auto it = snapshots_.find(seq);
+    // 找不到说明调用方重复释放了同一个句柄，属于用法错误。
+    // 不崩（返回即可），但删掉快照对象——否则调用方拿它再放一次就是 UAF。
+    if (it != snapshots_.end()) {
+      if (--it->second == 0) snapshots_.erase(it);
+    }
+  }
+  delete snapshot;
+}
+
+SequenceNumber DBImpl::EarliestSnapshot() const {
+  std::lock_guard<std::mutex> lk(snapshot_mu_);
+  if (snapshots_.empty()) return kMaxSequenceNumber;
+  // std::map 按 key 有序，最小键即最早快照。
+  return static_cast<SequenceNumber>(snapshots_.begin()->first);
+}
+
+Status DBImpl::Get(const Slice& key, std::string* value,
+                   const ReadOptions& options) {
   // 1) 取活跃 MemTable 的引用。
   //    临界区内完成 load + Ref：mem_ 恒有 DB 持有的所有权引用，所以此刻
   //    load 到的表必然存活，Ref 一定成功（对比旧的"load + TryRef 重试"写法，
@@ -770,7 +907,20 @@ Status DBImpl::Get(const Slice& key, std::string* value) {
   }
   if (m == nullptr) return Status::NotFound("db not ready");
 
-  const SequenceNumber snapshot = last_sequence_.load(std::memory_order_acquire);
+  // 快照点解析：用户传的值必须被截断到"当前已提交的最大 sequence"。
+  //
+  // 【为什么不能直接用 options.snapshot】
+  // 默认值是 kMaxSequenceNumber（意为"读最新"）。但写路径是"先把 batch 插进
+  // MemTable、再 release 发布 last_sequence_"，这两步之间存在窗口：另一个线程
+  // 此时读 kMaxSequenceNumber，会看见 MemTable 里 seq > last_sequence_ 的条目——
+  // 也就是**尚未确认提交的数据**。若那批写入随后失败（比如 fsync 报错），读者
+  // 就看到了一个从未真正提交的值。
+  //
+  // 所以默认走 last_sequence_（严格只读已提交数据）；用户显式传了更小的值时，
+  // 取两者较小者：既能做历史读，又绝不会越过"已提交"这条线。
+  SequenceNumber snapshot = last_sequence_.load(std::memory_order_acquire);
+  if (options.snapshot < snapshot) snapshot = options.snapshot;
+
   bool found = false;
   Status s = m->Get(key, snapshot, value, &found);
   if (found) {  // 命中（值或删除）-> 不必再查 SSTable
@@ -821,7 +971,11 @@ Status DBImpl::Get(const Slice& key, std::string* value) {
 // NewIterator：跨 MemTable 与全部 SSTable 的归并迭代器
 // ---------------------------------------------------------------------------
 std::unique_ptr<Iterator> DBImpl::NewIterator(const ReadOptions& options) const {
-  const SequenceNumber snapshot = options.snapshot;
+  // 快照点解析与 Get 完全一致（并含同样的理由）：默认取 last_sequence_，
+  // 用户显式传入的值截断到它。两条读路径的快照语义必须相同，否则"用同一个
+  // ReadOptions 先迭代再点查"会看到两个不同的视图。
+  SequenceNumber snapshot = last_sequence_.load(std::memory_order_acquire);
+  if (options.snapshot < snapshot) snapshot = options.snapshot;
 
   // Version：与 Get 同样在锁内取引用。迭代期间 flush 可以换版本，但本迭代器
   // 只依赖这一份 Version 的文件列表（Table 本身由 VersionSet 的缓存持有），
@@ -854,11 +1008,12 @@ std::unique_ptr<Iterator> DBImpl::NewIterator(const ReadOptions& options) const 
   v->Unref();
 
   // 包一层，让这些引用跟着迭代器的生命周期走（见 TableReleasingIterator 注释）。
+  //
+  // 注意这里**不**自动 SeekToFirst：迭代器的初始位置是"无效"，由调用方显式
+  // 选择 SeekToFirst / SeekToLast / Seek 之一。这样职责清晰，也避免了
+  // "构造即定位"给后续想加反向遍历埋下语义歧义。
   return std::make_unique<TableReleasingIterator>(std::move(it), versions_,
                                                   std::move(borrowed));
-
-  it->SeekToFirst();
-  return it;
 }
 
 }  // namespace tinystore

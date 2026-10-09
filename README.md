@@ -51,6 +51,9 @@ cmake --build build-asan && ctest --test-dir build-asan
 # ThreadSanitizer（抓 data race）
 cmake -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DTINYSTORE_ENABLE_TSAN=ON
 cmake --build build-tsan && ctest --test-dir build-tsan
+# 在 WSL2 上 TSAN 需要解除地址空间布局限制，且一次跑多个进程会互相干扰，
+# 因此逐个执行（Linux 原生环境直接用上面的 ctest 即可）：
+bash tools/run_tsan_wsl.sh
 
 # 严格警告（提交前跑一次，专项清理整型转换问题）
 cmake -B build-strict -G Ninja -DTINYSTORE_STRICT_WARNINGS=ON
@@ -100,23 +103,22 @@ TinyStore/
 | **W5** | 迭代器：`DB::NewIterator` + SSTable 遍历 + 跨源归并 + MVCC 过滤 + 快照读 | ✅ 完成 |
 | **W6** | Compaction：Leveled 策略 + 墓碑回收 + TableCache 引用计数 | ✅ 完成 |
 | **W7** | Compaction 后台化：`Env::Schedule` + 生命周期安全等待 | ✅ 完成 |
+| **W8** | P1 收口：TableCache LRU 淘汰 + Snapshot 句柄 API + 迭代器反向遍历 + Compaction 优先级与限流 | ✅ 完成 |
 
 > 说明：原规划把「读路径 / BloomFilter」列为 W5、「Flush / Version / MANIFEST」列为 W6。
 > 实际执行时这两块内容合并进了 W4 一次提交（原 W5、W6 的条目已不再单列）。
-> W2 也并入了原 W3 的 WAL 部分。下表是**尚未完成**的工作，按依赖与优先级重排。
+> W2 也并入了原 W3 的 WAL 部分。W8 收口了原「后续计划」里的全部 P1 项。
 
 ### 后续计划
 
 | 优先级 | 主题 | 动机 / 现状缺口 |
 |---|---|---|
-| **P1** | **Compaction 优先级与限流** | W7 已把压缩挪到后台线程。当前"谁的层先超阈值就先压谁"，没有按收益排序；也没有 IO 限流，压缩与前台写入仍会互相抢磁盘带宽 |
-| **P1** | **迭代器反向遍历**（`Prev` / `SeekToLast`） | W5 已完成正向遍历。反向需 SSTable 能反向定位并倒序扫描块，而前缀压缩让倒序扫描需要额外维护解压栈，属独立工作量 |
-| **P1** | **TableCache LRU 淘汰** | W6 已加引用计数使淘汰变得安全，但缓存仍只增不减、不按容量淘汰，长期运行内存无上限。需 LRU + 容量上限 |
-| **P1** | **Snapshot 句柄 API** | `ReadOptions.snapshot` 已能按序号做历史读（W5），但缺 `GetSnapshot()` / `ReleaseSnapshot()` 这样的生命周期句柄，无法表达"先取快照、再做别的、最后按快照读"这一自然用法 |
 | **P2** | **可靠性工程**：`TestEnv` 故障注入 + 崩溃一致性测试 | `env.h` 已预留 `EnvWrapper` 与 `Schedule`/`StartThread`，但尚未落地。需注入「第 N 次写失败 / 截断文件 / 损坏 CRC」等故障，验证恢复路径；以及真正的 `kill -9` 崩溃测试 |
 | **P2** | **文件锁**（`Env::LockFile`） | 接口已定义但未使用。缺少它，多进程同时打开同一目录会各自维护 MemTable 与 VersionSet 并并发写同一个 MANIFEST，直接损坏数据 |
 | **P2** | **MANIFEST 快照与压缩** | MANIFEST 目前只追加、从不压缩。W6 引入 compaction 后增删记录变频繁，长时间运行会无限增长，重放时间随之线性上升 |
-| **P3** | **性能与可观测**：Block 缓存、统计信息、`Logger` 落地 | `ApproximateOffsetOf` 当前是简化版；`Logger` 接口存在但未接入；缺读写延迟 / flush 次数 / compaction 字节数等指标。W6 已加了文件数与分层字节数，可作为起点 |
+| **P2** | **多版本压缩（Compaction 选点优化）** | W8 已能按压力选层，但 L1→L2 仍是"整层全部文件参与"。真实负载下应改为按字节预算滚动选点，避免一次归并搬运整个层 |
+| **P3** | **性能与可观测**：Block 缓存、统计信息、`Logger` 落地 | `ApproximateOffsetOf` 当前是简化版；`Logger` 接口存在但未接入。W8 已加了缓存条目数/字节数与写放大计数，可作为指标体系的起点 |
+| **P3** | **反向迭代的按键范围扫描** | W8 的 `Prev` 每次都要扫过该 user_key 的全部版本（总代价 O(总 entry 数)）。数据量上来后可加"范围反向扫描"接口，只在块边界回扫 |
 | **P4** | 可选扩展：`epoll` Reactor + RESP 协议、Raft 复制 | 网络层与分布式复制，属于加分项，不影响存储引擎主线 |
 
 ---
