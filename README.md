@@ -179,24 +179,39 @@ TSAN 下不运行此测试：TSAN 无法跨 fork 跟踪访问，会产生大量�
 
 ---
 
-## W1 质量状态
+## 当前质量状态
 
 | 检查项 | 结果 |
 |---|---|
-| 单元测试 | ✅ 7 / 7 通过 |
-| ASAN（含 Debug assert） | ✅ 7 / 7 通过 |
-| TSAN | ✅ 7 / 7 通过，零告警 |
-| 编译警告 | ✅ 零警告（`-Wall -Wextra -Wpedantic -Wshadow` 等） |
+| 单元测试 | ✅ 17 / 17 通过（`db_test` 40 个用例） |
+| ASAN（含 Debug assert） | ✅ 17 / 17 通过，无泄漏、无越界 |
+| TSAN | ✅ 16 / 16 通过，零数据竞争 |
+| 崩溃恢复 | ✅ 4 个崩溃点 + 2 个文件锁用例（fork + exec 驱动真实进程死亡） |
+| 编译警告 | ✅ 常规构建零警告；`-Wsign-conversion` 严格档尚有 36 处待清理 |
 
-### 第一组性能数据
+三套配置均在 WSL2 / GCC 13.3 上验证。TSAN 需 `setarch -R` 解除地址空间布局限制
+并逐个执行，脚本见 `tools/run_tsan_wsl.sh`。
 
-10,000 次分配，WSL2 / GCC 13.3：
+**性能基线**（Arena vs `malloc`，W1 实测）与 Group Commit 的真实收益见
+[`docs/design-notes.md`](docs/design-notes.md) §四 与 §7.6。
 
-| 尺寸 | Arena | malloc/free | new/delete |
-|---|---|---|---|
-| 32 B | **19.0 μs** | 298.1 μs | 232.0 μs |
-| 128 B | **340.1 μs** | 559.8 μs | 428.9 μs |
-| 1024 B | 3,585.8 μs | **3,366.7 μs** | **2,291.7 μs** |
+---
 
-小对象场景 Arena 快 15.7 倍；但 1024 字节时反而更慢。
-原因分析与工程启示见 `docs/design-notes.md`。
+## 时间线
+
+```
+W1   工程地基（Slice / Status / Coding / Comparator / Arena / InternalKey / Env）
+W2   MemTable / SkipList / WriteBatch / WAL / CRC32C
+W3   DB 写路径 + Group Commit + 无锁快照读
+W4   读路径 + 持久化：SSTable / Bloom / Version / MANIFEST / 崩溃恢复
+     fix(W4)  审查修复：静默丢数据、RCU UAF、整数溢出、过滤器泄漏
+W5   迭代器：跨源归并 + MVCC 可见性 + 快照读
+W6   Compaction：Leveled 策略 + 墓碑回收 + TableCache 引用计数
+W7   Compaction 后台化：写路径不再被压缩阻塞
+W8   P1 收口：LRU 淘汰 / Snapshot 句柄 / 反向遍历 / 优先级与限流
+W9   可靠性：库级排他锁 + 崩溃恢复测试
+W10  审查修复：两处 UAF、损坏被吞、错误被降级
+```
+
+每个阶段最大的收获都不是"实现了功能"，而是**发现了上一阶段想漏了什么**——
+细节见 [`docs/design-notes.md`](docs/design-notes.md) 的 §九~§十六。

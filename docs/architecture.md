@@ -1,7 +1,16 @@
 # TinyStore 架构说明
 
-> 本文是**全局视角**的架构文档：数据怎么流动、文件怎么布局、机制为什么这样设计。
-> 单个模块内部的取舍见代码注释；W1~W3 的设计决策见 [`design-notes.md`](design-notes.md)（该文写于 W3 阶段，W4~W9 的决策记录在本文第五章）。
+> **四份文档的分工**，避免内容漂移：
+>
+> | 文档 | 回答的问题 | 何时读 |
+> |---|---|---|
+> | **本文件** `architecture.md` | 系统**是什么**：数据怎么流动、文件怎么布局、配置怎么解释 | 第一次接触本项目，或要改某个模块前 |
+> | [`design-notes.md`](design-notes.md) | **为什么这样设计**：每个决策的取舍、踩过的坑、实测数据 | 想知道"为什么不是另一种做法"时；面试准备 |
+> | [`code-review.md`](code-review.md) | **哪里还有问题**：已确认的缺陷、证伪记录、修复状态 | 接手维护，或准备改某处已知脆弱区域前 |
+> | `README.md` | 怎么构建、当前状态、还剩什么 | 起点 |
+>
+> 本文件是**全局视角**。单个模块内部的取舍见代码注释；W1~W3 的设计决策见
+> `design-notes.md` §三~§七，W4~W10 的决策与踩坑见该文件 §九~§十六。
 > 当前已知的缺陷与待办见 [`code-review.md`](code-review.md)。
 
 ---
@@ -228,20 +237,23 @@ W1~W3 见 `design-notes.md`。以下记录后续阶段中**容易被后来者推
 
 ## 六、配置项
 
+所有配置在 `DB::Open` 入口统一校验，非法值当场报错——而不是留到某次压缩时
+以整数除零或数组越界的形式爆出来。
+
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `create_if_missing` | `false` | ⚠️ **当前未实现**，打开不存在的库会静默创建（见 `code-review.md` W6） |
-| `error_if_exists` | `false` | 目录已存在则报错 |
-| `write_buffer_size` | 4MB | MemTable 超过则 flush |
+| `create_if_missing` | `false` | 目录不存在时**报错**而非静默创建 |
+| `error_if_exists` | `false` | 目录已存在则报错（防误开别人的库） |
+| `write_buffer_size` | 4MB | MemTable 超过则 flush。统计的是记录实际字节数，不是 Arena 预留量 |
 | `max_table_cache_bytes` | 64MB | SSTable 缓存上限，0 = 不淘汰 |
 | `block_size` | 4KB | data block 目标大小 |
 | `l0_compaction_trigger` | 4 | L0 文件数达此值触发压缩 |
 | `max_level_bytes` | 8MB | L1 容量 |
-| `max_level_bytes_multiplier` | 10 | 每层容量倍率，⚠️ 设为 0 会整数除零 |
-| `max_num_levels` | 7 | ⚠️ 末层压缩会产出第 8 层，该层永不参与压缩 |
+| `max_level_bytes_multiplier` | 10 | 每层容量倍率。**必须 ≥ 1**（0 会整数除零） |
+| `max_num_levels` | 7 | **必须 ≥ 2**。末层（L6）不再向下压缩，避免产出永不参与压缩的第 8 层 |
 | `max_compaction_file_size` | 2MB | 单个 compaction 输出文件目标大小 |
 | `compaction_max_write_amplification` | 1 | 压缩输出 ≤ 写入量 × 该系数 |
-| `compaction_backlog_factor` | 4 | L0 积压超过 `trigger × factor` 时豁免限流 |
+| `compaction_backlog_factor` | 4 | L0 积压超过 `trigger × factor` 时豁免限流（纯读负载的逃生阀） |
 
 ---
 
